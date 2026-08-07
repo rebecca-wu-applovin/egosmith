@@ -28,10 +28,15 @@ egosmith_filtered/
 
 | dataset | kept (filtered) | GT mode | frame-tar payload |
 |---|---:|---|---|
-| taco | 1,846 | recon `use_gt` (GT cam+hand → SLAM+infiller) | `.image.jpg` |
-| hot3d | 357 | recon `use_gt` | `.image.jpg` |
-| oakink_actions | 2,488 | recon `use_gt` | `.image.jpg` |
-| egodex | 158,564 | native (`use_gt` = in-tar GT) | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` |
+| taco | 1,846 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
+| hot3d | 357 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
+| oakink_actions | 2,488 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
+| egodex | 158,564 | native — GT read straight from the tar | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` |
+
+All GT here is **ground truth, not pixel-estimated**. For taco/hot3d/oakink the datasets ship GT
+MANO + GT camera, which the converter packages into the pipeline's canonical world-space
+`world_space_res.pth` (GT re-expressed, no SLAM/HaWoR estimation). A video-only reconstruction
+track (pose estimated from pixels) existed but was dropped — it had scale artifacts.
 
 EgoDex funnel: 338,234 converted → 177,979 Layer‑1 → **158,564** Layer‑4.
 
@@ -57,8 +62,10 @@ The single loader `load_descriptor_episode_features`
 
 - **native** (`== "wds_lowdim_mano_v1"`, EgoDex): per-frame GT read **from the tar** —
   `.lowdim.npy` (116‑d Vision‑Pro world pose) + `.mano.npy`. `seq_folder` unused.
-- **recon / use_gt** (taco/hot3d/oakink_actions): pose read from
-  `seq_folder/world_space_res.pth`, then MANO forward → lowdim features.
+- **use_gt** (taco/hot3d/oakink_actions): the dataset's **GT** world-space MANO pose, stored in
+  `seq_folder/world_space_res.pth` (`trans/rot/hand_pose/betas`, 2 hands × T), then MANO forward →
+  lowdim features. This is GT-derived (GT MANO + GT camera converted to canonical world space) — not
+  estimated from pixels.
 
 So every dataset flows through the same code path; you do **not** special-case by dataset name.
 
@@ -98,5 +105,5 @@ for line in open("clip_manifest.filtered.jsonl"):
 
 **Two things to remember:**
 - **Frames** are read by byte offset from the `.tar` (`src/lib/pipeline/io/frame_sources.py`) — don't untar.
-- The recon **`world_space_res.pth`** is a repo-specific format — load it via the repo loader
+- The **`world_space_res.pth`** (use_gt datasets) is a repo-specific format — load it via the repo loader
   (`load_descriptor_episode_features` / `_load_world_space_prediction`), **not** raw `torch.load`.
