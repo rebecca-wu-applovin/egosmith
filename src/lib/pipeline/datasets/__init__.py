@@ -13,13 +13,16 @@ from lib.pipeline.datasets.base import (
 from lib.pipeline.datasets.descriptors import ClipDescriptor, STORAGE_IMAGE_SEQUENCE, STORAGE_TAR_SHARD
 
 _BUILTIN_ADAPTER_MODULES = {
+    "arctic_tar": "lib.pipeline.datasets.arctic_tar",
     "buildai": "lib.pipeline.datasets.buildai",
     "flat_shard": "lib.pipeline.datasets.flat_shard",
     "fpha_tar": "lib.pipeline.datasets.fpha_tar",
     "image_sequence": "lib.pipeline.datasets.image_sequence",
     "hot3d_wds": "lib.pipeline.datasets.hot3d_wds",
     "legacy_buildai": "lib.pipeline.datasets.legacy_buildai",
+    "oakink_tar": "lib.pipeline.datasets.oakink_tar",
     "single_video": "lib.pipeline.datasets.single_video",
+    "taco_tar": "lib.pipeline.datasets.taco_tar",
     "video_folder": "lib.pipeline.datasets.video_folder",
 }
 
