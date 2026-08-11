@@ -3,7 +3,7 @@
 
 TACO (CVPR 2024) ships ground-truth bimanual MANO hand poses, per-frame egocentric
 camera extrinsics/intrinsics, and egocentric RGB videos, laid out as
-``<component>/(tool, action, object)/<date>_<id>/...``.
+``<component>/(action, tool, object)/<date>_<id>/...``.
 
 Per sequence this script produces the same artifacts the FPHA GT ingestion produces
 (`generate_fpha_world_res.py`), so `scripts/build/filter_manifest_by_quality.py`
@@ -47,7 +47,10 @@ for _p in (str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)):
 from lib.pipeline.proc.stage_api import get_stage_done_marker  # noqa: E402
 
 _SEQ_DIR_RE = re.compile(r"^\d{8}_\d+$")
-_TRIPLET_RE = re.compile(r"^\((?P<tool>[^,]+),\s*(?P<action>[^,]+),\s*(?P<object>[^)]+)\)$")
+# TACO's directory triplets are ordered (action, tool, object) -- e.g. "(cut, knife, bowl)",
+# "(dust, brush, bowl)", "(pour in some, bowl, bowl)": the first token is always the verb.
+# (The dataset's TACO acronym is Tool-Action-Object, which is easy to misread as the dir order.)
+_TRIPLET_RE = re.compile(r"^\((?P<action>[^,]+),\s*(?P<tool>[^,]+),\s*(?P<object>[^)]+)\)$")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -139,8 +142,9 @@ def discover_sequences(taco_root: Path) -> tuple[list[dict], list[dict]]:
         if missing_items:
             missing.append({"triplet": triplet, "seq_name": seq_name, "missing": missing_items})
             continue
-        tool, action, obj = (sanitize_token(match.group(g)) for g in ("tool", "action", "object"))
-        entry["clip_id"] = f"TACO_{tool}_{action}_{obj}_{seq_name}"
+        action, tool, obj = (sanitize_token(match.group(g)) for g in ("action", "tool", "object"))
+        # clip_id keeps the on-disk token order: TACO_<action>_<tool>_<object>_<seq>
+        entry["clip_id"] = f"TACO_{action}_{tool}_{obj}_{seq_name}"
         entry["tool"], entry["action"], entry["object"] = tool, action, obj
         complete.append(entry)
     return complete, missing
