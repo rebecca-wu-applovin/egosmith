@@ -66,6 +66,14 @@ def build_parser():
         help="Minimum ratio of visible-hand frames where wrist/fingertips have at least one projected point inside the image",
     )
     parser.add_argument(
+        "--min_hand_size_ratio",
+        type=float,
+        default=None,
+        help="Layer-A hand-size gate ported to Layer C: drop clips where even the closest visible "
+             "hand's projected-joint bbox never covers this fraction of the image (far/small interaction). "
+             "None = off.",
+    )
+    parser.add_argument(
         "--max_visible_hand_all_points_out_of_frame_streak",
         type=int,
         default=30,
@@ -314,6 +322,7 @@ def build_report(
         "episode_camera_iqr_multiplier": criteria.get("episode_camera_iqr_multiplier"),
         "fatal_offscreen_scale": criteria["fatal_offscreen_scale"],
         "min_visible_hand_any_point_inframe_ratio": criteria["min_visible_hand_any_point_inframe_ratio"],
+        "min_hand_size_ratio": criteria.get("min_hand_size_ratio"),
         "max_visible_hand_all_points_out_of_frame_streak": criteria["max_visible_hand_all_points_out_of_frame_streak"],
         "camera_space_auto_method": criteria["camera_space_auto_method"],
         "camera_space_iqr_multiplier": criteria["camera_space_iqr_multiplier"],
@@ -396,6 +405,7 @@ def run_filter(args) -> dict:
         "episode_camera_iqr_multiplier": args.episode_camera_iqr_multiplier,
         "fatal_offscreen_scale": float(args.fatal_offscreen_scale),
         "min_visible_hand_any_point_inframe_ratio": args.min_visible_hand_any_point_inframe_ratio,
+        "min_hand_size_ratio": args.min_hand_size_ratio,
         "max_visible_hand_all_points_out_of_frame_streak": args.max_visible_hand_all_points_out_of_frame_streak,
         "max_camera_space_wrist_abs": args.max_camera_space_wrist_abs,
         "max_camera_space_hand_abs": args.max_camera_space_hand_abs,

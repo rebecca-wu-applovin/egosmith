@@ -43,10 +43,18 @@ def classify_hand_projection(points_world, extrinsic, intrinsic, image_size, *, 
         & (uv[:, 1] < float(height) + margin_y)
     )
 
+    # Layer-A "hand size" analog: bounding-box area of the projected hand joints as a
+    # fraction of the image. A persistently tiny value => hand far/small => unreliable.
+    bbox_area_ratio = float("nan")
+    if int(np.count_nonzero(valid)) >= 2:
+        u, v = uv[valid, 0], uv[valid, 1]
+        bbox_area_ratio = float((u.max() - u.min()) * (v.max() - v.min()) / (float(width) * float(height)))
+
     return {
         "uv": uv,
         "valid": valid,
         "any_point_inframe": bool(np.any(inframe)),
         "all_points_out_of_frame": bool(np.all(~inframe)),
         "all_points_severe_offscreen": bool(np.all(~severe_bounds)),
+        "bbox_area_ratio": bbox_area_ratio,
     }

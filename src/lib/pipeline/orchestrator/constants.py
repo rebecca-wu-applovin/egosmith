@@ -34,6 +34,8 @@ BATCH_INFER_NEGATIVE_BOOL_FLAGS = {
     "detect_half_precision",
     "depth_predict_all_frames",
     "any4d_use_amp",
+    "use_gt",
+    "use_anycalib",
 }
 
 MULTIHOST_DISALLOWED_INFER_KEYS = {

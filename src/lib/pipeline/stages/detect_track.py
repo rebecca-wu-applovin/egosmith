@@ -26,6 +26,20 @@ def detect_track_video(args, detector_runner=None, force=False, detect_batch_siz
     os.makedirs(seq_folder, exist_ok=True)
     vprint(f'Running detect_track on {seq_folder} ...')
 
+    ##### AnyCalib focal (optional) — learned intrinsics instead of the W/2 guess #####
+    # Runs here (earliest per-clip stage) so est_focal.txt lands before slam/motion call
+    # resolve_calibration. Only when --use_anycalib is set and no focal is already known.
+    if getattr(args, "use_anycalib", False) and getattr(args, "img_focal", None) is None:
+        from lib.pipeline.io.intrinsics import read_recorded_focal, _persist_focal
+        if read_recorded_focal(seq_folder) is None:
+            from lib.pipeline.calib.anycalib_estimator import estimate_focal
+            focal = estimate_focal(frame_source, device=device)
+            if focal is not None:
+                _persist_focal(seq_folder, focal)
+                vprint(f"anycalib: estimated focal={focal:.1f} -> est_focal.txt")
+            else:
+                vprint("anycalib: estimation failed -> resolve_calibration will use default")
+
     ##### Detection + Track #####
     vprint('Detect and Track ...')
 

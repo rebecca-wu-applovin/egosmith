@@ -65,6 +65,9 @@ def new_clip_quality_stats(
         "fatal_visible_right_severe_offscreen_frames": 0,
         "max_visible_left_out_of_frame_streak": 0,
         "max_visible_right_out_of_frame_streak": 0,
+        # largest projected-joint bbox area ratio over in-frame frames (Layer-A hand-size analog)
+        "max_visible_left_hand_size_ratio": 0.0,
+        "max_visible_right_hand_size_ratio": 0.0,
         "_camera_space_wrist_min": np.full((3,), np.inf, dtype=np.float32),
         "_camera_space_wrist_max": np.full((3,), -np.inf, dtype=np.float32),
         "_camera_space_hand_min": np.full((3,), np.inf, dtype=np.float32),
@@ -265,6 +268,11 @@ def update_clip_quality_stats(
             if projection["any_point_inframe"]:
                 stats[f"visible_{hand_name}_any_point_inframe_frames"] += 1
                 stats[f"_visible_{hand_name}_out_of_frame_streak"] = 0
+                _r = projection.get("bbox_area_ratio")
+                if _r is not None and np.isfinite(_r):
+                    stats[f"max_visible_{hand_name}_hand_size_ratio"] = max(
+                        stats[f"max_visible_{hand_name}_hand_size_ratio"], float(_r)
+                    )
             else:
                 stats[f"_visible_{hand_name}_out_of_frame_streak"] += 1
                 stats[f"max_visible_{hand_name}_out_of_frame_streak"] = max(

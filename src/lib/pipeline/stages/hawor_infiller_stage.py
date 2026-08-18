@@ -517,6 +517,19 @@ def run_infiller_for_video(
     cam_space_cache=None,
     return_timing=False,
 ):
+    # --- GT branch: use pre-provided ground-truth hand world poses instead of running the infiller.
+    # When --use_gt is set and a final artifact (world_space_res.pth / result.npz) is already staged in
+    # the seq_folder, adopt it and skip both the infiller model load and the fill pass. Falls back to
+    # the normal infiller if no GT is present. detect_track/motion still ran (Layer-B gates).
+    if getattr(args, "use_gt", False):
+        _sf = _resolve_seq_folder(args, seq_folder)
+        if result_io.final_artifact_exists(Path(_sf)):
+            vprint("infiller: use_gt -> using pre-provided GT world_space_res (skipped infiller model + compute)")
+            if return_timing:
+                return {"timing": {"gt_loaded": True}}
+            return
+        vprint("infiller: use_gt set but no GT world_space_res found in seq_folder -> running infiller")
+
     infiller_runner = infiller_runner or build_infiller_runner(args.infiller_weight)
     filling_model = infiller_runner["model"]
     device = infiller_runner["device"]

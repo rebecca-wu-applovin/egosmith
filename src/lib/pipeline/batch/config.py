@@ -43,6 +43,8 @@ class BatchRunConfig:
     detect_io_workers: int = 8
     rebuild_cam_space_cache: bool = False
     depth_predict_all_frames: Optional[bool] = True
+    use_gt: bool = False
+    use_anycalib: bool = False
     any4d_repo_root: Optional[str] = None
     any4d_checkpoint_path: Optional[str] = None
     any4d_resolution_set: Optional[int] = None
@@ -140,6 +142,8 @@ class BatchRunConfig:
             detect_io_workers=getattr(ns, "detect_io_workers", 8),
             rebuild_cam_space_cache=bool(getattr(ns, "rebuild_cam_space_cache", False)),
             depth_predict_all_frames=getattr(ns, "depth_predict_all_frames", True),
+            use_gt=bool(getattr(ns, "use_gt", False)),
+            use_anycalib=bool(getattr(ns, "use_anycalib", False)),
             any4d_repo_root=getattr(ns, "any4d_repo_root", None),
             any4d_checkpoint_path=getattr(ns, "any4d_checkpoint_path", None),
             any4d_resolution_set=getattr(ns, "any4d_resolution_set", None),
