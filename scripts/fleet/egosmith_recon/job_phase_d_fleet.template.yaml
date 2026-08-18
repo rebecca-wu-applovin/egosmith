@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: phase-d-fleet
+  namespace: airflow
+spec:
+  completionMode: Indexed
+  completions: 11
+  parallelism: 11
+  backoffLimit: 100
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: fr-airflow-cbf
+      nodeSelector:
+        node_pool: l4
+      tolerations:
+      - {key: "l4-pool", operator: "Equal", value: "true", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Equal", value: "present", effect: "NoSchedule"}
+      containers:
+      - name: phase-d
+        image: gcr.io/strategic-atom-700/egosmith-recon-l4:v1
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_phase_d.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        resources:
+          # CPU-only: fits a fresh L4 node; C's pending pods (gpu:8, cpu:80) can't co-schedule,
+          # so whichever job wins a new node owns it outright
+          requests: {cpu: "80", memory: "200Gi", ephemeral-storage: "60Gi"}
+          limits:   {cpu: "92", memory: "300Gi", ephemeral-storage: "100Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 100Gi}

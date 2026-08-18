@@ -1,0 +1,23 @@
+# Build-context excludes for the EgoSmith reconstruction L4 image.
+# NOTE: docker uses the .dockerignore at the *context root*; cloudbuild.yaml copies
+# this file to the repo root before `gcloud builds submit`.
+
+.git
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+
+# Force a clean DPVO build so the image gets sm_89 cubins (the dev-box build/ is sm_90).
+thirdparty/DPVO/build
+thirdparty/DPVO/models.zip
+
+# Large checkpoints — pulled from GCS at pod init, not baked (keeps image lean).
+weights/hawor/checkpoints/hawor.ckpt
+weights/hawor/checkpoints/infiller.pt
+thirdparty/Any4D/checkpoints/*.pth
+
+# Not needed at runtime.
+.cursor
+notebooks
+**/*.tar
+**/*.ipynb

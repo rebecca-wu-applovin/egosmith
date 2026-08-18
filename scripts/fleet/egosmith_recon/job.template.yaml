@@ -1,0 +1,50 @@
+# EgoSmith reconstruction — K8s Indexed Job template (rendered by launch.sh via envsubst).
+# One pod per shard; each pod uses all 8 L4 GPUs of its g2-standard-96 node and runs one
+# batch_infer over its stride-slice. Idempotent (skip-if-done on GCS) → re-apply resumes.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: egosmith-recon-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${NSHARDS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node_pool: l4
+      tolerations:
+      - {key: "l4-pool", operator: "Equal", value: "true", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Equal", value: "present", effect: "NoSchedule"}
+      containers:
+      - name: recon
+        image: ${IMAGE}
+        # Pull the orchestration script fresh from GCS so script tweaks need no image
+        # rebuild (the image carries the heavy conda env; pod_entry is just glue).
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry.sh /tmp/pod_entry.sh && exec bash /tmp/pod_entry.sh"]
+        workingDir: /repo
+        env:
+        - {name: MODE,         value: "${MODE}"}
+        - {name: NSHARDS,      value: "${NSHARDS}"}
+        - {name: MANIFEST_GCS, value: "gs://foundational-research/hoi-dataset/egosmith_recon/manifests/${MODE}${MANIFEST_SUFFIX}.manifest.jsonl"}
+        - {name: FLEETMAP_GCS, value: "gs://foundational-research/hoi-dataset/egosmith_recon/manifests/${MODE}${MANIFEST_SUFFIX}.fleetmap.tsv"}
+        - {name: GCS_WEIGHTS,  value: "gs://foundational-research/hoi-dataset/egosmith_filtered/weights"}
+        - {name: LOCAL_ROOT,   value: "/scratch/egosmith_recon"}
+        - {name: ANY4D_BATCH_SIZE, value: "${ANY4D_BATCH_SIZE}"}
+        - {name: CHUNK_CLIPS, value: "${CHUNK_CLIPS}"}
+        - {name: USE_ANYCALIB, value: "${USE_ANYCALIB}"}
+        resources:
+          requests: {nvidia.com/gpu: "8", cpu: "80", memory: "300Gi"}
+          limits:   {nvidia.com/gpu: "8", cpu: "90", memory: "360Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 400Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 64Gi}

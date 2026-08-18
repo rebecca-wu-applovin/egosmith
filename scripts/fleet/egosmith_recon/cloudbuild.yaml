@@ -1,0 +1,20 @@
+# Cloud Build config for the EgoSmith reconstruction L4 image.
+# Submit with build.sh (which passes --ignore-file so the 10GB checkpoints and the
+# stale sm_90 DPVO build/ never enter the upload/context).
+substitutions:
+  _IMAGE: "gcr.io/strategic-atom-700/egosmith-recon-l4:v1"
+options:
+  machineType: "E2_HIGHCPU_32"
+  diskSizeGb: 200
+timeout: 5400s
+steps:
+- name: "gcr.io/cloud-builders/docker"
+  args:
+    - build
+    - -f
+    - scripts/fleet/egosmith_recon/Dockerfile
+    - -t
+    - "${_IMAGE}"
+    - .
+images:
+- "${_IMAGE}"

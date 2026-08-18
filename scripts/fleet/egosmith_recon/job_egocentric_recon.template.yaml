@@ -1,0 +1,55 @@
+# Egocentric-100K Phase C reconstruction — K8s Indexed Job (rendered by python os.path.expandvars).
+# One pod per Phase-B shard (1:1, 3000); each pod owns a whole 8xL4 node and runs chunked
+# batch_infer (CHUNK_CLIPS=64) over its ~6.8K sub-clips (~20h/shard). Per-clip skip-if-done +
+# shard done-markers make re-apply resume cheap. All three zones (a/b/c) -> up to 90 nodes.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ego-recon-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 3000   # weeks-long job; nodes will die, retries must be plentiful
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node_pool: l4
+      tolerations:
+      - {key: "l4-pool", operator: "Equal", value: "true", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Equal", value: "present", effect: "NoSchedule"}
+      containers:
+      - name: ego-recon
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_egocentric_recon.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        workingDir: /repo
+        env:
+        - {name: NSHARDS,     value: "${COMPLETIONS}"}
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: CHUNK_CLIPS,      value: "${CHUNK_CLIPS}"}
+        - {name: PER_GPU_CHUNK,    value: "${PER_GPU_CHUNK}"}
+        - {name: ANY4D_BATCH_SIZE, value: "${ANY4D_BATCH_SIZE}"}
+        - {name: MAX_CLIPS,        value: "${MAX_CLIPS}"}
+        - {name: LOCAL_ROOT,       value: "/scratch/ego_recon"}
+        - {name: FRAMES_GCS,    value: "${FRAMES_GCS}"}
+        - {name: MANIFESTS_GCS, value: "${MANIFESTS_GCS}"}
+        - {name: OUT_GCS,       value: "${OUT_GCS}"}
+        resources:
+          # whole node: 8 L4 + most vCPU (jpeg decode is CPU-hungry at 8 workers).
+          # ephemeral <=130Gi: nodes allocate ~162Gi; 200Gi silently blocks autoscaling.
+          requests: {nvidia.com/gpu: "8", cpu: "80", memory: "300Gi", ephemeral-storage: "100Gi"}
+          limits:   {nvidia.com/gpu: "8", cpu: "90", memory: "360Gi", ephemeral-storage: "130Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 130Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 64Gi}
