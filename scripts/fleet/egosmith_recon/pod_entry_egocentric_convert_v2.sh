@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# pod_entry_egocentric_convert.sh — Phase B: Egocentric-100K Layer-1 survivors -> 15fps
-# undistorted sub-clip frame tars + per-shard clip manifest.
+# pod_entry_egocentric_convert_v2.sh — Phase B: Layer-1 survivors -> 15fps undistorted
+# sub-clip frame tars + per-shard clip manifest. v2 = v1 + OUT_WIDTH support for
+# high-res sources (Egocentric-10K 1920x1080 -> validated 456x256 recon regime) via a
+# standalone fleet copy of generate_egocentric_wds.py (the shared egosmith_code.tar.gz
+# is NOT touched — the running 100K recon still pulls the original tarball).
 #
 # Sharding is 1:1 with the Stage-1 shards (3000): shard i consumes
 #   <KEPT_GCS>/shard_XXXXX.kept.jsonl
@@ -27,7 +30,7 @@ NSHARDS="${NSHARDS:-3000}"
 NPROC="${NPROC:-4}"
 MAX_CLIPS="${MAX_CLIPS:-0}"           # >0 = smoke cap
 TARGET_FPS="${TARGET_FPS:-15}"
-OUT_WIDTH="${OUT_WIDTH:-0}"   # >0: downscale undistorted frames (e.g. 456 for 1080p sources)
+OUT_WIDTH="${OUT_WIDTH:-0}"           # >0 = downscale undistorted output to this width (10K: 456)
 LOCAL_ROOT="${LOCAL_ROOT:-/scratch/ego_convert}"; mkdir -p "$LOCAL_ROOT"
 FLEET=gs://foundational-research/hoi-dataset/egosmith_recon/fleet
 KEPT_GCS="${KEPT_GCS:-gs://foundational-research/hoi-dataset/egosmith_filtered/egocentric100k/stage1/_shards}"
@@ -38,7 +41,10 @@ log(){ echo "[ego_convert][shard $SHARD/$NSHARDS] $*"; }
 
 # overlay current code onto /repo (image may be an older commit)
 gcloud storage cp "$FLEET/egosmith_code.tar.gz" /tmp/code.tar.gz 2>/dev/null && tar xzf /tmp/code.tar.gz -C "$REPO_ROOT" && log "overlaid current scripts+src"
+# v2: overlay the standalone out_width-capable converter LAST (wins over the tarball copy)
+gcloud storage cp "$FLEET/generate_egocentric_wds.py" scripts/build/generate_egocentric_wds.py && log "overlaid standalone generate_egocentric_wds.py (out_width)" || { log "FATAL: standalone converter pull failed"; exit 1; }
 ls scripts/build/generate_egocentric_wds.py >/dev/null 2>&1 || { log "FATAL: generate_egocentric_wds.py missing after overlay"; exit 1; }
+python -c "import re,sys; s=open('scripts/build/generate_egocentric_wds.py').read(); sys.exit(0 if 'out_width' in s else 1)" || { log "FATAL: overlaid converter lacks out_width"; exit 1; }
 
 # skip-if-done (report is the done marker, uploaded last)
 if gcloud storage ls "$MANIFESTS_GCS/shard_$sfx.report.json" >/dev/null 2>&1; then log "shard already done, skip"; exit 0; fi

@@ -1,0 +1,44 @@
+# g2-standard-8 (8 vCPU / ~32Gi) VARIANT of job_phase_d_fleet.template.yaml.
+# Targets the new MKS single-GPU L4 nodes. Originals untouched.
+# Phase D is CPU-only; on this pool a pod uses the node's CPU and leaves the L4 idle
+# (no GPU request — the gpu-Exists toleration still admits it past the node taint).
+# Changes vs original: nodeSelector by instance-type, model-serve + gpu-Exists
+# tolerations, resources trimmed from whole-96-vCPU-node (80cpu/200Gi) to <=7 vCPU /
+# <=28Gi; --workers must be scaled down accordingly via the pod entry's env.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: phase-d-fleet-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 100
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node.kubernetes.io/instance-type: g2-standard-8
+      tolerations:
+      - {key: "applvn.dev/workload", operator: "Equal", value: "model-serve", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule"}
+      containers:
+      - name: phase-d
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_phase_d.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        resources:
+          # CPU-only phase-D on a small node: <=7 vCPU, mem limit <=28Gi.
+          requests: {cpu: "6", memory: "20Gi", ephemeral-storage: "40Gi"}
+          limits:   {cpu: "7", memory: "28Gi", ephemeral-storage: "50Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 48Gi}

@@ -219,7 +219,9 @@ def _summ(vals):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True, choices=["taco", "oakink_grasp", "hot3d", "egodex"])
+    ap.add_argument("--dataset", required=True,
+                    choices=["taco", "oakink_grasp", "oakink_v2", "hot3d", "egodex",
+                             "dexycb", "ho3d", "show3d", "hoi4d"])
     ap.add_argument("--recon_root", required=True, help="dir of <clip>/ recon seq_folders")
     ap.add_argument("--gt_root", help="MANO datasets: dir of <clip>/ GT seq_folders")
     ap.add_argument("--egodex_frames_root", help="egodex: dir of <clip>.tar WDS frame tars")

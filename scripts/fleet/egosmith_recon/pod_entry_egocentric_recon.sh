@@ -148,7 +148,12 @@ run_gpu(){  # one GPU's slice: chunked batch_infer + per-chunk upload + disk cle
     [ -s "$ch" ] || continue
     ci=$((ci+1))
     local rd="$W/runs/g${g}_c${ci}"
+    # HARD CHUNK TIMEOUT: one hung batch_infer (observed: worker zombie at 3% GPU for
+    # days) otherwise wedges the whole pod behind `wait` while 7 GPUs idle. 90min >>
+    # any legitimate 48-clip chunk (~16min); on expiry kill the chunk, keep going —
+    # its unfinished clips are retried by the next pod via per-clip skip-if-done.
     HAWOR_STAGE3_TMP_ROOT="$W/hawor_tmp_g$g" HAWOR_BATCH_TMPDIR="$W/hawor_btmp_g$g" \
+    timeout -k 60 5400 \
     python scripts/batch_infer.py \
       --descriptor_manifest "$ch" \
       --gpus "$g" \
@@ -159,7 +164,7 @@ run_gpu(){  # one GPU's slice: chunked batch_infer + per-chunk upload + disk cle
       $DEPTH_FLAG \
       --resume
     local rc=$?; [ $rc -ne 0 ] && rc_g=$rc
-    [ -s "$rd/events.jsonl" ] && gcloud storage cp "$rd/events.jsonl" "$LOGS_GCS/shard_${sfx}_g${g}_c${ci}.events.jsonl" >/dev/null 2>&1
+    [ -s "$rd/events.jsonl" ] && timeout 600 gcloud storage cp "$rd/events.jsonl" "$LOGS_GCS/shard_${sfx}_g${g}_c${ci}.events.jsonl" >/dev/null 2>&1
     python3 - "$W" "$ch" "$g" <<'PY'
 import json, os, sys
 W, ch, g = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -175,7 +180,7 @@ open(f"{W}/chunk_ok_g{g}.txt", "w").write("".join(c + "\n" for c in ok))
 open(f"{W}/chunk_tars_g{g}.txt", "w").write("".join(t + "\n" for t in tars))
 PY
     xargs -r -P 4 -I{} -a "$W/chunk_ok_g$g.txt" bash -c \
-      'gcloud storage rsync -r "'"$W"'/outputs/{}" "'"$OUT_GCS"'/shard_'"$sfx"'/{}" >/dev/null 2>&1 && rm -rf "'"$W"'/outputs/{}"'
+      'timeout 600 gcloud storage rsync -r "'"$W"'/outputs/{}" "'"$OUT_GCS"'/shard_'"$sfx"'/{}" >/dev/null 2>&1 && rm -rf "'"$W"'/outputs/{}"'
     xargs -r -a "$W/chunk_tars_g$g.txt" rm -f
     # failed clips keep nothing: their partial outputs are pure disk leak (eviction killer)
     python3 -c "import json,sys,shutil

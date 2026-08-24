@@ -30,9 +30,14 @@ sys.path.insert(0, f"{EGOSMITH_ROOT}/src")
 import gcsfs
 import numpy as np
 
-GCS_OUT = "foundational-research/hoi-dataset/egosmith_recon/egocentric100k/recon/outputs"
-GCS_B = "foundational-research/hoi-dataset/egosmith_filtered/egocentric100k/phaseB/_shards"
-GCS_FILT = "foundational-research/hoi-dataset/egosmith_filtered/egocentric100k/filter_run/_shards"
+# Dataset prefixes are env-overridable (defaults = Egocentric-100K, unchanged behavior).
+# For other datasets in the same conveyor (e.g. egocentric10k), set all three envs.
+GCS_OUT = os.environ.get(
+    "PHASED_GCS_OUT", "foundational-research/hoi-dataset/egosmith_recon/egocentric100k/recon/outputs")
+GCS_B = os.environ.get(
+    "PHASED_GCS_B", "foundational-research/hoi-dataset/egosmith_filtered/egocentric100k/phaseB/_shards")
+GCS_FILT = os.environ.get(
+    "PHASED_GCS_FILT", "foundational-research/hoi-dataset/egosmith_filtered/egocentric100k/filter_run/_shards")
 WORK = Path(os.environ.get("PHASED_WORK", "/root/egosmith_annotations/_phased_work"))
 NPZ_KEYS = ["traj", "tstamp", "img_focal", "img_center", "scale"]
 

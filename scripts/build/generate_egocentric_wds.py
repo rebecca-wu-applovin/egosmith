@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target_fps", type=float, default=15.0, help="Recon fps (source is 30)")
     p.add_argument("--balance", type=float, default=0.0, help="cv2.fisheye undistort balance (FOV knob)")
     p.add_argument("--jpeg_quality", type=int, default=88)
+    p.add_argument("--out_width", type=int, default=0, help=">0: downscale undistorted output to this width")
     p.add_argument("--max_clips", type=int, default=0, help=">0: cap clips (smoke)")
     p.add_argument("--max_intervals_per_clip", type=int, default=0, help=">0: cap intervals per clip")
     p.add_argument("--min_interval_sec", type=float, default=2.0)
@@ -54,19 +55,32 @@ def build_parser() -> argparse.ArgumentParser:
 _MAPS: dict[str, tuple] = {}
 
 
-def worker_map(fs, worker_gs: str, balance: float):
-    """cv2.fisheye undistort maps + resulting pinhole focal for one worker's device."""
-    if worker_gs in _MAPS:
-        return _MAPS[worker_gs]
+def worker_map(fs, worker_gs: str, balance: float, out_width: int = 0):
+    """cv2.fisheye undistort maps + resulting pinhole focal for one worker's device.
+
+    out_width > 0: undistort straight into a downscaled pinhole target (newK scaled),
+    so high-res sources (e.g. Egocentric-10K 1920x1080) land in the validated recon
+    resolution regime in a single remap — no separate resize pass.
+    """
+    key = (worker_gs, out_width)
+    if key in _MAPS:
+        return _MAPS[key]
     path = worker_gs.replace("gs://", "") + "/intrinsics.json"
     intr = json.load(fs.open(path))
     W, H = int(intr["image_width"]), int(intr["image_height"])
     K = np.array([[intr["fx"], 0, intr["cx"]], [0, intr["fy"], intr["cy"]], [0, 0, 1]], np.float64)
     D = np.array([intr["k1"], intr["k2"], intr["k3"], intr["k4"]], np.float64)
     newK = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(K, D, (W, H), np.eye(3), balance=balance)
-    m1, m2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), newK, (W, H), cv2.CV_16SC2)
-    out = (m1, m2, float(newK[0, 0]), W, H)
-    _MAPS[worker_gs] = out
+    Wo, Ho = W, H
+    if out_width and out_width < W:
+        sc = out_width / W
+        Wo, Ho = out_width, int(round(H * sc / 2) * 2)
+        newK = newK.copy()
+        newK[0, :] *= sc
+        newK[1, :] *= Ho / H
+    m1, m2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), newK, (Wo, Ho), cv2.CV_16SC2)
+    out = (m1, m2, float(newK[0, 0]), Wo, Ho)
+    _MAPS[key] = out
     return out
 
 
@@ -122,7 +136,7 @@ def main() -> None:
 
 
 def _convert_clip(rec, mp4_bytes, fs, args, frames_root, outputs_root, records, stats):
-    m1, m2, focal, W, H = worker_map(fs, rec["worker"], args.balance)
+    m1, m2, focal, W, H = worker_map(fs, rec["worker"], args.balance, args.out_width)
     src_fps = float(rec.get("fps") or 30.0)
     step = max(1, int(round(src_fps / args.target_fps)))          # 30 -> 15fps = every 2nd frame
     ivs = rec.get("intervals", [])
