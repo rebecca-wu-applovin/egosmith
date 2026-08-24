@@ -1,0 +1,59 @@
+# Cat-1 Phase C reconstruction. Variant of job_egocentric_recon.e10k.template.yaml:
+#   * pod entry -> pod_entry_cat1_recon.sh (est_focal optional + --use_anycalib)
+#   * REQUIRES the v2 image (egosmith-recon-l4:v2, anycalib installed — proven by the
+#     egosmith-recon-recon-anycalib validation job)
+#   * USE_ANYCALIB env (default 1)
+# One whole 8xL4 node per Phase-B shard. NEVER schedule this on g2-standard-8.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cat1-recon-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 3000
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node_pool: l4
+      tolerations:
+      - {key: "l4-pool", operator: "Equal", value: "true", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Equal", value: "present", effect: "NoSchedule"}
+      containers:
+      - name: cat1-recon
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_cat1_recon.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        workingDir: /repo
+        env:
+        - {name: NSHARDS,     value: "${COMPLETIONS}"}
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: CHUNK_CLIPS,      value: "${CHUNK_CLIPS}"}
+        - {name: PER_GPU_CHUNK,    value: "${PER_GPU_CHUNK}"}
+        - {name: ANY4D_BATCH_SIZE, value: "${ANY4D_BATCH_SIZE}"}
+        - {name: MAX_CLIPS,        value: "${MAX_CLIPS}"}
+        - {name: USE_ANYCALIB,     value: "${USE_ANYCALIB}"}
+        - {name: LOCAL_ROOT,       value: "/scratch/ego_recon"}
+        - {name: FRAMES_GCS,    value: "${FRAMES_GCS}"}
+        - {name: MANIFESTS_GCS, value: "${MANIFESTS_GCS}"}
+        - {name: OUT_GCS,       value: "${OUT_GCS}"}
+        - {name: LOGS_GCS,      value: "${LOGS_GCS}"}
+        resources:
+          # whole node: 8 L4 + most vCPU. ephemeral <=130Gi: nodes allocate ~162Gi;
+          # a 200Gi request silently blocks autoscaling.
+          requests: {nvidia.com/gpu: "8", cpu: "80", memory: "300Gi", ephemeral-storage: "100Gi"}
+          limits:   {nvidia.com/gpu: "8", cpu: "90", memory: "360Gi", ephemeral-storage: "130Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 130Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 64Gi}
