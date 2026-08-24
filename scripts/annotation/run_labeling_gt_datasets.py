@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, "/root/egosmith/src")
 
 # reuse the exact build_content/client from the validated experiment harness
+_HERE = os.path.dirname(os.path.abspath(__file__))
 _src = open(f"{_HERE}/annotation_harness_reference.py").read().split("clips = pick_clips(10)")[0]
 ns = {}
 exec(compile(_src, "ablation_harness", "exec"), ns)
@@ -36,6 +37,7 @@ DATASETS = {
     "oakink_actions": {"local": "/root/oakink/grasp/frames"},
     "hot3d":          {"local": "/root/hot3d/frames"},
     "egodex":         {"local": "/root/egodex/frames"},
+    "dexcap":         {"local": "/root/cat2/dexcap/frames"},
 }
 OUT_DIR = "/root/egosmith_annotations"
 PX, DETAIL, TARGET_FPS, FMIN, FMAX = 1024, "high", 3.0, 12, 40
