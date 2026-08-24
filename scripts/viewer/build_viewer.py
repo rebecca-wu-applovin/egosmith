@@ -141,6 +141,65 @@ def sample_ego(ds, ad, n, seed, shards_k=10):
     return out[:n]
 
 
+def sample_dropped_ego(ds, ad, n, seed):
+    """Sample DROPPED clips (with reasons) from per-shard filter reports; descriptors
+    come from the phaseB manifest (dropped clips are absent from filtered.jsonl)."""
+    rng = random.Random(seed + 1)
+    pb = ad["filt"].replace("/filter_run/_shards", "/phaseB/_shards")
+    reports = [p for p in fs.ls(ad["filt"]) if p.endswith(".report.json")]
+    out, seen_reasons = [], {}
+    for rp in rng.sample(reports, min(12, len(reports))):
+        if len(out) >= n:
+            break
+        rep = json.loads(fs.open(rp, "rb").read())
+        dropped = [d for d in rep.get("dropped", []) if d.get("drop_category") == "quality"]
+        rng.shuffle(dropped)
+        sfx = os.path.basename(rp).split(".")[0].replace("shard_", "")
+        picked = []
+        for d in dropped:  # spread across distinct primary reasons
+            key = (d.get("reasons") or ["?"])[0]
+            if seen_reasons.get(key, 0) >= max(2, n // 5):
+                continue
+            seen_reasons[key] = seen_reasons.get(key, 0) + 1
+            picked.append(d)
+            if len(picked) >= 2:
+                break
+        if not picked:
+            continue
+        by_id = {d["clip_id"]: d for d in picked}
+        for line in fs.open(f"{pb}/shard_{sfx}.manifest.jsonl", "rb").read().decode().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r["clip_id"] in by_id:
+                out.append(dict(rec=r, ann=None, shard=sfx,
+                                reasons=by_id[r["clip_id"]].get("reasons", [])))
+    return out[:n]
+
+
+def sample_dropped_cat3(ds, ad, n, seed):
+    rng = random.Random(seed + 1)
+    base = f"{BUCKET}/egosmith_filtered/{ds}/filter_run"
+    rep_path = f"{base}/filter_report.json"
+    if not fs.exists(rep_path):
+        return []
+    rep = json.loads(fs.open(rep_path, "rb").read())
+    dropped = rep.get("dropped", [])
+    if not dropped:
+        return []
+    pre = f"{base}/clip_manifest.jsonl"
+    recs = {r["clip_id"]: r for r in _read_jsonl_gcs(pre)} if fs.exists(pre) else {}
+    rng.shuffle(dropped)
+    out = []
+    for d in dropped:
+        if len(out) >= n:
+            break
+        r = recs.get(d["clip_id"])
+        if r:
+            out.append(dict(rec=r, ann=None, shard=None, reasons=d.get("reasons", [])))
+    return out
+
+
 def sample_cat3(ds, ad, n, seed):
     rng = random.Random(seed)
     manifest, _ = _cat3_paths(ds)
@@ -188,11 +247,49 @@ def render_dataset(ds, n, seed, work):
                               note="pre-rendered GT-mode overlay", meta={},
                               annotation=(anns.get(cid) or {}).get("annotation"),
                               extra_rows=[]))
+        # dropped: no pre-rendered viz — render from frames tar + use_gt recon outputs
+        dropped = sample_dropped_cat3(ds, ad, max(6, n // 5), seed)
+        print(f"[{ds}] sampled {len(cards)} kept + {len(dropped)} dropped", flush=True)
+        for s in dropped:
+            cid = s["rec"]["clip_id"]
+            d = s["rec"]["descriptor"]
+            tar_local = wdir / "_tars" / f"{cid}.tar"
+            tar_local.parent.mkdir(parents=True, exist_ok=True)
+            out = clips_dir / f"{cid}.mp4"
+            try:
+                fs.get(f"{BUCKET}/egosmith_filtered/{ds}/frames/"
+                       f"{os.path.basename(d['shard_path'])}", str(tar_local))
+                seq = materialize_seq(f"{BUCKET}/egosmith_recon/{ds}/use_gt/outputs/{cid}",
+                                      wdir / "_seq" / cid)
+                st = render_recon_overlay(tar_local, seq, out, float(d.get("fps") or 30.0))
+            except Exception as e:  # noqa: BLE001
+                errors.append({"clip_id": cid, "stage": "dropped", "error": str(e)[:200]})
+                continue
+            finally:
+                tar_local.unlink(missing_ok=True)
+            cards.append(dict(clip_id=cid, video=f"clips/{cid}.mp4", status=st["status"],
+                              note=st.get("note"), section="dropped",
+                              reasons=s.get("reasons", []),
+                              meta={k: st.get(k) for k in ("dur_s", "fps", "w", "h", "hand_pct")},
+                              annotation=None, extra_rows=[]))
+            print(f"[{ds}] dropped {cid} {st['status']}", flush=True)
         _finish(ds, wdir, cards, errors, n)
         return
 
-    samples = sample_ego(ds, ad, n, seed) if ad["kind"] == "ego" else sample_cat3(ds, ad, n, seed)
-    print(f"[{ds}] sampled {len(samples)} clips", flush=True)
+    n_dropped = max(6, n // 5)
+    if ad["kind"] == "ego":
+        samples = sample_ego(ds, ad, n, seed)
+        dropped = sample_dropped_ego(ds, ad, n_dropped, seed)
+    else:
+        samples = sample_cat3(ds, ad, n, seed)
+        dropped = sample_dropped_cat3(ds, ad, n_dropped, seed)
+    for s in samples:
+        s["section"] = "kept"
+    for s in dropped:
+        s["section"] = "dropped"
+    samples = samples + dropped
+    print(f"[{ds}] sampled {len(samples) - len(dropped)} kept + {len(dropped)} dropped",
+          flush=True)
 
     def fetch(s):
         rec, cid = s["rec"], s["rec"]["clip_id"]
@@ -246,11 +343,13 @@ def render_dataset(ds, n, seed, work):
         finally:
             tar_local.unlink(missing_ok=True)
         cards.append(dict(clip_id=cid, video=f"clips/{cid}.mp4", status=st["status"],
-                          note=st.get("note"),
+                          note=st.get("note"), section=s.get("section", "kept"),
+                          reasons=s.get("reasons", []),
                           meta={k: st.get(k) for k in ("dur_s", "fps", "w", "h", "hand_pct")},
                           annotation=(s["ann"] or {}).get("annotation"),
                           extra_rows=[]))
-        print(f"[{ds}] {len(cards)}/{len(samples)} {cid} {st['status']}", flush=True)
+        print(f"[{ds}] {len(cards)}/{len(samples)} {cid} {st['status']} {s.get('section')}",
+              flush=True)
     _finish(ds, wdir, cards, errors, n)
 
 
@@ -279,6 +378,7 @@ CSS = """
 font:15px/1.5 system-ui,-apple-system,sans-serif;padding:2rem}
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 h1{font-size:1.5rem;margin:0 0 .3rem}
+h2{font-size:1.15rem;margin:2rem 0 .3rem;color:var(--bad)}
 .sub{color:var(--mut);margin-bottom:1.2rem}
 .legend{display:inline-flex;gap:1rem;background:var(--panel);border:1px solid var(--line);
 border-radius:6px;padding:.4rem .8rem;font-size:.85rem;margin-bottom:1.4rem}
@@ -380,6 +480,10 @@ def _card_html(c):
         segs_html = f'<div class="seg">{rows}</div>'
     else:
         segs_html = '<div class="seg"><div class="lv"><span>&mdash; no annotation &mdash;</span></div></div>'
+    if c.get("reasons"):
+        note += ('<div class="note">dropped: '
+                 + " ".join(f'<span class="badge b-bad">{esc(r)}</span>' for r in c["reasons"])
+                 + "</div>")
     src = c.get("video_uri") or c["video"]
     raw = f' &middot; <a href="{esc(c["raw_url"])}">full quality &nearr;</a>' if c.get("raw_url") else ""
     return (f'<figure class="card"><video controls loop muted playsinline preload="metadata" '
@@ -390,15 +494,25 @@ def _card_html(c):
 
 def dataset_html(ds, cards, stats):
     chips = "".join(f'<span class="chip">{esc(k)} <b>{esc(v)}</b></span>' for k, v in stats)
-    body = "".join(_card_html(c) for c in cards)
+    kept = [c for c in cards if c.get("section", "kept") == "kept"]
+    dropped = [c for c in cards if c.get("section") == "dropped"]
+    body = "".join(_card_html(c) for c in kept)
+    dropped_html = ""
+    if dropped:
+        dropped_html = (f'<h2>Dropped examples ({len(dropped)})</h2>'
+                        f'<div class="sub">Clips the quality filter rejected, with reasons '
+                        f'&mdash; overlays show <em>why</em> (off-screen wrists, kinematic '
+                        f'jumps, camera drift).</div>'
+                        f'<div class="grid">{"".join(_card_html(c) for c in dropped)}</div>')
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<title>{esc(ds)} — filtered data viewer</title><style>{CSS}</style></head><body>'
             f'<h1>{esc(ds)}</h1><div class="sub"><a href="{AUTH_BASE}/index.html">&larr; all datasets</a>'
-            f' &middot; {CATEGORY.get(ds, "")} &middot; {len(cards)} sampled instances</div>'
+            f' &middot; {CATEGORY.get(ds, "")} &middot; {len(kept)} kept instances</div>'
             f'<div class="legend"><span><span class="dotl"></span>left hand</span>'
             f'<span><span class="dotr"></span>right hand</span></div>'
-            f'<div class="stats">{chips}</div><div class="grid">{body}</div></body></html>')
+            f'<div class="stats">{chips}</div><div class="grid">{body}</div>'
+            f'{dropped_html}</body></html>')
 
 
 def root_html(rows):
