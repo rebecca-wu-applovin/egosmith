@@ -315,6 +315,33 @@ def esc(s):
     return html.escape(str(s)) if s is not None else ""
 
 
+# storage.cloud.google.com serves HTML via one-time signed googleusercontent redirects,
+# so RELATIVE links/subresources 404. Dataset pages therefore embed videos as data URIs
+# (self-contained) and all inter-page links are absolute auth URLs.
+AUTH_BASE = f"https://storage.cloud.google.com/{VIEWER}"
+EMBED_MAX_BYTES = 900_000   # embed as-is under this; re-encode smaller above it
+
+
+def _embed_uri(mp4_path):
+    """data:video/mp4 URI, re-encoding big clips down (8s cap, 288p, crf 33)."""
+    import base64
+    import tempfile
+    p = Path(mp4_path)
+    data = p.read_bytes()
+    if len(data) > EMBED_MAX_BYTES:
+        import imageio_ffmpeg
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as t:
+            tmp = t.name
+        subprocess.run([ff, "-y", "-loglevel", "error", "-t", "8", "-i", str(p),
+                        "-vf", "scale=-2:'min(288,ih)'", "-c:v", "libx264",
+                        "-pix_fmt", "yuv420p", "-crf", "33", "-movflags", "+faststart",
+                        "-an", tmp], check=True, capture_output=True)
+        data = Path(tmp).read_bytes()
+        os.unlink(tmp)
+    return "data:video/mp4;base64," + base64.b64encode(data).decode()
+
+
 def _card_html(c):
     m = c.get("meta") or {}
     bits = []
@@ -353,10 +380,12 @@ def _card_html(c):
         segs_html = f'<div class="seg">{rows}</div>'
     else:
         segs_html = '<div class="seg"><div class="lv"><span>&mdash; no annotation &mdash;</span></div></div>'
+    src = c.get("video_uri") or c["video"]
+    raw = f' &middot; <a href="{esc(c["raw_url"])}">full quality &nearr;</a>' if c.get("raw_url") else ""
     return (f'<figure class="card"><video controls loop muted playsinline preload="metadata" '
-            f'src="{c["video"]}"></video><div class="body">'
+            f'src="{src}"></video><div class="body">'
             f'<div class="cid">{esc(c["clip_id"])}{badge}</div>'
-            f'<div class="meta">{" &middot; ".join(bits)}</div>{note}{segs_html}</div></figure>')
+            f'<div class="meta">{" &middot; ".join(bits)}{raw}</div>{note}{segs_html}</div></figure>')
 
 
 def dataset_html(ds, cards, stats):
@@ -365,7 +394,7 @@ def dataset_html(ds, cards, stats):
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<title>{esc(ds)} — filtered data viewer</title><style>{CSS}</style></head><body>'
-            f'<h1>{esc(ds)}</h1><div class="sub"><a href="../index.html">&larr; all datasets</a>'
+            f'<h1>{esc(ds)}</h1><div class="sub"><a href="{AUTH_BASE}/index.html">&larr; all datasets</a>'
             f' &middot; {CATEGORY.get(ds, "")} &middot; {len(cards)} sampled instances</div>'
             f'<div class="legend"><span><span class="dotl"></span>left hand</span>'
             f'<span><span class="dotr"></span>right hand</span></div>'
@@ -374,7 +403,7 @@ def dataset_html(ds, cards, stats):
 
 def root_html(rows):
     trs = "".join(
-        f'<tr><td><a href="{esc(ds)}/index.html">{esc(ds)}</a></td><td>{esc(cat)}</td>'
+        f'<tr><td><a href="{AUTH_BASE}/{esc(ds)}/index.html">{esc(ds)}</a></td><td>{esc(cat)}</td>'
         f'<td class="num">{n}</td><td class="num">{ov}</td><td>{esc(extra)}</td></tr>'
         for ds, cat, n, ov, extra in rows)
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -406,19 +435,27 @@ def dataset_stats(ds, ad, cards):
     return stats
 
 
-def publish(ds, work):
+def publish(ds, work, upload_clips=True):
     wdir = work / ds
     cards = json.loads((wdir / "cards.json").read_text())
+    for c in cards:
+        mp4 = wdir / c["video"]
+        if mp4.exists():
+            c["video_uri"] = _embed_uri(mp4)
+            c["raw_url"] = f"{AUTH_BASE}/{ds}/{c['video']}"
     stats = dataset_stats(ds, ADAPTERS.get(ds), cards)
-    (wdir / "index.html").write_text(dataset_html(ds, cards, stats))
+    page = wdir / "index.html"
+    page.write_text(dataset_html(ds, cards, stats))
+    print(f"[{ds}] page size {page.stat().st_size/1e6:.1f} MB", flush=True)
     dst = f"gs://{VIEWER}/{ds}"
     subprocess.run(["gcloud", "storage", "cp", "--content-type=text/html", "-q",
-                    str(wdir / "index.html"), f"{dst}/index.html"], check=True)
-    subprocess.run(["gcloud", "storage", "cp", "--content-type=video/mp4", "-q"]
-                   + [str(p) for p in sorted((wdir / "clips").glob("*.mp4"))]
-                   + [f"{dst}/clips/"], check=True)
-    subprocess.run(["gcloud", "storage", "cp", "-q", str(wdir / "cards.json"),
-                    f"{dst}/cards.json"], check=True)
+                    str(page), f"{dst}/index.html"], check=True)
+    if upload_clips:
+        subprocess.run(["gcloud", "storage", "cp", "--content-type=video/mp4", "-q"]
+                       + [str(p) for p in sorted((wdir / "clips").glob("*.mp4"))]
+                       + [f"{dst}/clips/"], check=True)
+        subprocess.run(["gcloud", "storage", "cp", "-q", str(wdir / "cards.json"),
+                        f"{dst}/cards.json"], check=True)
     print(f"[{ds}] published -> https://storage.cloud.google.com/{VIEWER}/{ds}/index.html",
           flush=True)
 
