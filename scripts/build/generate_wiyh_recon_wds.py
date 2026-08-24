@@ -231,8 +231,8 @@ def main() -> None:
     Path(args.outputs_root).mkdir(parents=True, exist_ok=True)
     records: list = []
     stats = {"samples": 0, "subclips": 0, "frames": 0, "errors": 0,
-             "skipped_short_samples": 0, "source_sec": 0.0, "kept_sec_out": 0.0,
-             "sample_gz_bytes": 0}
+             "stub_samples": 0, "skipped_short_samples": 0, "source_sec": 0.0,
+             "kept_sec_out": 0.0, "sample_gz_bytes": 0}
     t0 = time.time()
     n_done = 0
     for sample_name, gz_path, gz_bytes, cleanup in _iter_sample_tars(args):
@@ -241,6 +241,12 @@ def main() -> None:
         try:
             root = _extract_needed(gz_path, tmp)
             if root is None:
+                # stub export: archive holds only an empty directory entry (seen at the
+                # head of Hotel parts) — skip without counting as a converter error
+                if gz_bytes < 1_000_000:
+                    stats["stub_samples"] += 1
+                    print(f"  STUB {sample_name[:70]} ({gz_bytes} bytes)", flush=True)
+                    continue
                 raise RuntimeError("no dataset.hdf5 in sample")
             convert_sample(root, sample_name, args, records, stats)
             stats["sample_gz_bytes"] += int(gz_bytes)
@@ -253,7 +259,7 @@ def main() -> None:
         n_done += 1
         print(f"[{n_done}] {sample_name[:70]} subclips_total={stats['subclips']} "
               f"({time.time()-t0:.0f}s)", flush=True)
-        if args.max_samples and n_done >= args.max_samples:
+        if args.max_samples and stats["samples"] >= args.max_samples:
             break
 
     write_clip_manifest(records, args.manifest_out)
