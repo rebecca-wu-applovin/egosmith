@@ -407,9 +407,11 @@ class AssemblyHandsExtractor:
     L_TIPS = [21, 25, 29, 33, 37]; L_MCP = {"middle": 32, "index": 28}; L_WRIST = 41
 
     def __init__(self, gcs_prefix, split="val", version="v1-1", images_root=None,
-                 assembly101_video_prefix=None, min_valid_tips=3, unit_scale=0.001,
-                 max_frames_per_clip=None):
+                 annotations_root=None, assembly101_video_prefix=None, min_valid_tips=3,
+                 unit_scale=0.001, max_frames_per_clip=None, split_runs=False,
+                 min_run_frames=60):
         self.gcs_prefix = gcs_prefix.rstrip("/")
+        self.annotations_root = annotations_root  # local <root>/<split>/assemblyhands_* jsons
         self.split = split
         self.version = version
         self.images_root = images_root
@@ -418,6 +420,13 @@ class AssemblyHandsExtractor:
         self.min_valid_tips = int(min_valid_tips)
         self.unit_scale = float(unit_scale)
         self.max_frames_per_clip = max_frames_per_clip
+        # AssemblyHands annotations are 30 Hz on a 60 fps frame grid (frame_idx step 2), but
+        # frames without hands were removed from the release, leaving index gaps that would
+        # read as teleports to the step gates. split_runs=True enumerates one episode per
+        # contiguous run (frame_idx step == 2) of >= min_run_frames frames instead of one
+        # per (seq, camera). Measured on val: 93% of frames live in runs >= 60.
+        self.split_runs = bool(split_runs)
+        self.min_run_frames = int(min_run_frames)
         self._cache = {}
 
     def _annos(self, work: Path):
@@ -426,9 +435,14 @@ class AssemblyHandsExtractor:
         base = f"{self.gcs_prefix}/annotations/{self.split}"
         names = {k: f"assemblyhands_{self.split}_{k}_{self.version}.json"
                  for k in ("ego_data", "joint_3d", "ego_calib")}
+        out = {}
+        if self.annotations_root:  # local mirror (avoids concurrent-download races)
+            for k, n in names.items():
+                out[k] = json.loads((Path(self.annotations_root) / self.split / n).read_text())
+            self._cache["data"] = out
+            return out
         local = work.parent / "_ah_annotations"
         local.mkdir(parents=True, exist_ok=True)
-        out = {}
         for k, n in names.items():
             p = local / n
             if not p.is_file():
@@ -437,31 +451,68 @@ class AssemblyHandsExtractor:
         self._cache["data"] = out
         return out
 
-    def list_episodes(self, limit=None):
-        # episode ref = "seq_name::camera"; enumeration needs the ego_data json
-        work = Path(tempfile.mkdtemp(prefix="ah_list_"))
-        data = self._annos(work / "x")
-        pairs = sorted({(im["seq_name"], im["camera"]) for im in data["ego_data"]["images"]})
-        refs = [f"{s}::{c}" for s, c in pairs]
-        return refs[:limit] if limit else refs
-
-    def load(self, episode_ref: str, work: Path) -> dict:
-        seq, camera = episode_ref.split("::")
-        data = self._annos(work)
+    def _seq_cam_rows(self, seq: str, camera: str, data: dict) -> list:
+        """Sorted (im, fkey) rows for (seq, cam) that have both joint_3d and extrinsics."""
         ims = [im for im in data["ego_data"]["images"]
                if im["seq_name"] == seq and im["camera"] == camera]
         ims.sort(key=lambda im: im["frame_idx"])
-        joints = data["joint_3d"]["annotations"][seq]
+        joints = data["joint_3d"]["annotations"].get(seq, {})
+        calib = data["ego_calib"]["calibration"].get(seq, {})
+        cam_key = camera if camera in calib.get("intrinsics", {}) else f"{camera}_mono10bit"
+        extr = calib.get("extrinsics", {})
+        rows = []
+        for im in ims:
+            fkey = f"{im['frame_idx']:06d}"
+            if fkey in joints and fkey in extr and cam_key in extr[fkey]:
+                rows.append((im, fkey))
+        return rows
+
+    @staticmethod
+    def _runs(rows: list) -> list:
+        """Split rows into contiguous 30 Hz runs (frame_idx step == 2)."""
+        runs, cur = [], []
+        for row in rows:
+            if cur and row[0]["frame_idx"] - cur[-1][0]["frame_idx"] != 2:
+                runs.append(cur)
+                cur = []
+            cur.append(row)
+        if cur:
+            runs.append(cur)
+        return runs
+
+    def list_episodes(self, limit=None):
+        # episode ref = "seq_name::camera" (whole sequence) or "seq_name::camera::rNNN"
+        # (one contiguous annotated run) when split_runs is on.
+        work = Path(tempfile.mkdtemp(prefix="ah_list_"))
+        data = self._annos(work / "x")
+        pairs = sorted({(im["seq_name"], im["camera"]) for im in data["ego_data"]["images"]})
+        if not self.split_runs:
+            refs = [f"{s}::{c}" for s, c in pairs]
+            return refs[:limit] if limit else refs
+        refs = []
+        for s, c in pairs:
+            runs = self._runs(self._seq_cam_rows(s, c, data))
+            refs.extend(f"{s}::{c}::r{i:03d}" for i, run in enumerate(runs)
+                        if len(run) >= self.min_run_frames)
+        return refs[:limit] if limit else refs
+
+    def load(self, episode_ref: str, work: Path) -> dict:
+        parts = episode_ref.split("::")
+        seq, camera = parts[0], parts[1]
+        run_idx = int(parts[2][1:]) if len(parts) > 2 else None
+        data = self._annos(work)
         calib = data["ego_calib"]["calibration"][seq]
         cam_key = camera if camera in calib["intrinsics"] else f"{camera}_mono10bit"
         K = np.array(calib["intrinsics"][cam_key], np.float64)
         intr = np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]], np.float32)
+        joints = data["joint_3d"]["annotations"][seq]
 
-        rows = []
-        for im in ims:
-            fkey = f"{im['frame_idx']:06d}"
-            if fkey in joints and fkey in calib["extrinsics"]:
-                rows.append((im, fkey))
+        rows = self._seq_cam_rows(seq, camera, data)
+        if run_idx is not None:
+            runs = self._runs(rows)
+            if run_idx >= len(runs):
+                raise ValueError(f"run index out of range for {episode_ref}: {len(runs)} runs")
+            rows = runs[run_idx]
         if len(rows) < 3:
             raise ValueError(f"too few annotated frames for {episode_ref}: {len(rows)}")
         if self.max_frames_per_clip:
@@ -485,7 +536,7 @@ class AssemblyHandsExtractor:
         rt, rR, rtips, rvalid = hand(self.R_TIPS, self.R_WRIST, self.R_MCP)
         lt, lR, ltips, lvalid = hand(self.L_TIPS, self.L_WRIST, self.L_MCP)
 
-        w0, h0 = ims[0]["width"], ims[0]["height"]
+        w0, h0 = rows[0][0]["width"], rows[0][0]["height"]
         frames = dict(mode="placeholder", width=int(w0), height=int(h0), count=T)
         extra = {"image_placeholder": True}
         if self.images_root:
@@ -521,7 +572,8 @@ class AssemblyHandsExtractor:
         return dict(
             lw_t=lt, rw_t=rt, lw_R=lR, rw_R=rR, ltips=ltips, rtips=rtips,
             valid_l=lvalid, valid_r=rvalid, w2c=w2c, intr=intr, fps=fps,
-            frames=frames, task=seq, desc="", episode_name=f"{seq}_{camera}",
+            frames=frames, task=seq, desc="",
+            episode_name=f"{seq}_{camera}" + (f"_r{run_idx:03d}" if run_idx is not None else ""),
             extra=extra,
         )
 

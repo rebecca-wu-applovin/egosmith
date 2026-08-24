@@ -14,14 +14,14 @@
 # Clips = one per (seq_name, ego camera). Annotated rate = 30 Hz (frame_idx step 2 @ 60 fps).
 dataset: assemblyhands
 source_id: assemblyhands
-split: val
+split: train
 fps: 30            # effective annotated rate; pass --source_fps 30
 lowdim_schema: assemblyhands_triangulated_world_v1
 extractor: assemblyhands_coco
 presence_requires_projection: true  # presence bit = tracked AND projects into this camera (1.3x margin)
 extractor_args:
   gcs_prefix: gs://foundational-research/hoi-dataset/AssemblyHands
-  split: val
+  split: train
   version: v1-1
   # Rectified ego images landed on the GCS mirror 2026-08-21 (20/20 official tars) and are
   # extracted locally — these are the EXACT pixels the ego_calib K/extrinsics describe, so the
