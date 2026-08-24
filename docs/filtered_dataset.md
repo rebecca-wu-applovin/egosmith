@@ -6,6 +6,11 @@ Hand–object-interaction clips that passed the EgoSmith filter pipeline (**Laye
 **Layer‑4** quality filter). Each dataset is self-contained: frame tars + a filtered clip manifest.
 One loader consumes all of them — the GT source is auto-detected per clip.
 
+**Browse samples** (video + keypoint overlay + LLM annotation, ~50 instances/dataset;
+requires bucket read access):
+<https://storage.cloud.google.com/foundational-research/hoi-dataset/egosmith_filtered/viewer/index.html>
+— built by `scripts/viewer/build_viewer.py` (re-run per dataset to refresh).
+
 ## Layout
 
 ```
