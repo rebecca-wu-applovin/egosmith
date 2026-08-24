@@ -1,0 +1,46 @@
+# RealDex spec v2 -- Shadow Dexterous Hand (rh_*) on a UR arm (ra_*), rosbag-extracted.
+# NEW FILE (v1 realdex.yaml left untouched; new-files-only rule).
+#
+# WHY v2: v1 limits were calibrated on the 5 sequences of the then-partial mirror
+# (3/53 object zips) and its own header said "refresh limits when more objects land".
+# The 2026-08-24 re-mirror brought the count to 11/53 zips (27 sequences); under v1
+# the 22 NEW sequences dropped 10/22 at pos_limits with envelope-edge signatures
+# (worst_excess 0.02-0.22 rad, violation frac 0.5-7.5%, velocity gates passing) --
+# the same small-sample-calibration pathology as DexWild v1 -> v3.
+# Limit derivation (2026-08-24): same formula as v1 (pos [p0.1-0.15, p99.9+0.15] on
+# |angle|, floored at 0; vel/acc p99.9 x 1.5) over ALL 27 mirrored sequences
+# (calib snapshot: /root/cat4_qc/realdex_new/calib_11zips.json), then UNION with the
+# v1 envelope so no previously-kept sequence can be re-dropped. Gate thresholds
+# unchanged from v1. Mirror upload stalled at 11/53 zips (last object 19:16Z, >4h);
+# if more zips land, refresh again by the same recipe.
+robot: shadow_hand_ur_arm
+dataset: realdex
+spec_version: 2
+license_note: >-
+  LICENSE CONCERN: RealDex ships under academic/research-only terms (per the RealDex
+  release; no LICENSE file is present in the GCS mirror to confirm redistribution
+  rights). Episodes are processed anyway per instruction -- downstream use must
+  re-review before any commercial training.
+streams:
+  hand_angles:
+    kind: measured
+    dof: 24
+    pos_min: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.635, 0.359, 0, 0, 1.421, 0, 0]
+    pos_max: [0.484, 0.902, 1.57, 1.52, 0.509, 1.46, 1.667, 1.105, 0.516, 1.31, 1.799, 1.12, 0.905, 0.577, 1.17, 1.757, 1.03, 1.282, 1.44, 0.403, 0.48, 1.742, 0.668, 0.831]
+    max_vel: [2.04, 4.9, 8.54, 11.8, 2.02, 5.14, 8.9, 11.9, 2.08, 5.47, 8.38, 10.3, 3.14, 2.17, 3.61, 8.1, 10.4, 1.59, 2.08, 2.25, 3.43, 1, 1.31, 1.8]
+    max_acc: [64.1, 261.2, 321.6, 428.1, 72.4, 256.6, 337.6, 399, 80.1, 221.8, 308.3, 332.6, 43.4, 44, 98.3, 296.5, 332.7, 34.6, 33.5, 80, 158.7, 30, 49.4, 80.7]
+  arm_angles:
+    kind: measured
+    dof: 6
+    pos_min: [0, 1.48, 0, 0, 1.41, 1.71]
+    pos_max: [0.891, 2.21, 2.2, 1.29, 2.686, 3.31]
+    max_vel: [1, 1, 1.1, 1.18, 1, 2.04]
+    max_acc: [15, 15, 15, 15, 15, 29.8]
+gates:
+  pos_limit: {max_violation_frac: 0.005}
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 10}
+  health: {min_len_s: 2.0, max_stall_s: 15.0, stall_eps_rad_s: 0.003, max_nan_frac: 0.0, max_const_channel_frac: 0.7}
+  dedup: {downsample_hz: 5, quant: 0.01}
