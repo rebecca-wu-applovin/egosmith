@@ -32,6 +32,7 @@ TARGET_FPS="${TARGET_FPS:-15}"
 OUT_WIDTH="${OUT_WIDTH:-456}"
 ID_MODE="${ID_MODE:-basename}"        # assembly101: group_basename; holoassist: session
 PER_VIDEO_TIMEOUT="${PER_VIDEO_TIMEOUT:-10800}"
+REMUX_MAX_GB="${REMUX_MAX_GB:-12}"
 LOCAL_ROOT="${LOCAL_ROOT:-/scratch/cat1_convert}"; mkdir -p "$LOCAL_ROOT"
 FLEET=gs://foundational-research/hoi-dataset/egosmith_recon/fleet
 FILT=gs://foundational-research/hoi-dataset/egosmith_filtered
@@ -80,6 +81,7 @@ for i in $(seq 0 $((NPROC-1))); do
       --target_fps "$TARGET_FPS" --out_width "$OUT_WIDTH" \
       --fisheye_intrinsics /tmp/cat1_fe.json \
       --per_video_timeout "$PER_VIDEO_TIMEOUT" \
+      --remux_max_gb "$REMUX_MAX_GB" \
       --work_dir "$W/work.p$i" > "$W/convert.p$i.log" 2>&1 &
     pids+=($!)
   fi

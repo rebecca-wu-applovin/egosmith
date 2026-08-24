@@ -88,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "contains a key is fisheye-undistorted with those intrinsics (cv2.fisheye)")
     p.add_argument("--fisheye_balance", type=float, default=0.0)
     p.add_argument("--per_video_timeout", type=int, default=10800)
+    p.add_argument("--remux_max_gb", type=float, default=12.0,
+                   help="skip the video-only remux above this source size (remux writes a "
+                        "full copy -> 2x disk peak; OPENCV_FFMPEG_READ_ATTEMPTS covers "
+                        "correctness, remux is a decode-speed optimization)")
     p.add_argument("--work_dir", default="/tmp/vwds")
     # internal isolation-worker mode
     p.add_argument("--one_video_json", default="")
@@ -283,7 +287,7 @@ def _convert_one(rec: dict, args, fisheye_cfg: dict) -> dict:
     local = _fetch(rec, work)
     try:
         ffmpeg = _find_ffmpeg()
-        if ffmpeg:
+        if ffmpeg and local.stat().st_size <= args.remux_max_gb * 1e9:
             local = _remux_video_only(local, ffmpeg)
         got = _decode_wanted(str(local), wanted, args.jpeg_quality, transform)
     finally:
