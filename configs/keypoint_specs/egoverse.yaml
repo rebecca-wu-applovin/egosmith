@@ -1,0 +1,33 @@
+# EgoVerse — processed_v3/<source>/<stamp>.zarr (zarr v3, sharding_indexed + zstd) with a
+# sibling <stamp>.mp4 (front_1 camera render, 640x480). Sources with zarr clips at probe time:
+# abc (18,456), aria (2,538), eva (3,079); lightwheel/mecka/microagi/scale/yam were mp4-only
+# or unverified. Language: EgoVerse/processed_annotations/<stamp>_annotations.json
+# (list of {text,start_idx,end_idx}); not consumed here (annotation stage handles it).
+# Conventions (verified numerically by projecting keypoints through obs_head_pose + intrinsics:
+# 98.7% positive depth, 90.4% in-bounds, median depth 0.47 m):
+#   *_pose (7,) = [x, y, z, qw, qx, qy, qz]  (quat_order wxyz), world frame, meters
+#   obs_keypoints (63,) = 21x3 world; wrist = row 0; fingertips = rows 4,8,12,16,20
+#   obs_head_pose = front_1 camera c2w (small head->camera offset ignored)
+#   missing hand = all-zero keypoint rows -> presence bit off
+dataset: egoverse
+source_id: egoverse
+split: train
+fps: 30            # zarr attributes.fps
+lowdim_schema: egoverse_keypoints_world_v1
+extractor: egoverse_zarr3
+presence_requires_projection: true  # presence bit = tracked AND projects into this camera (1.3x margin)
+# Tracker re-acquisition glitch pre-clean: a re-acquisition glitch is semantically a dropout
+# that reports garbage instead of absence, so it gets the same invalid->ffill treatment as
+# missing hands — we are NOT loosening the recon-tuned Stage-4 gates. Measured on aria:
+# wrist-rot Frobenius spikes >0.99 hit 0.32% of frames, 100% co-located with >=5 cm
+# single-frame keypoint jumps. Isolated-spike rule only (far from BOTH neighbors), so
+# genuine fast sustained motion is untouched.
+glitch_jump_thresh_m: 0.05      # single-frame wrist/fingertip jump (meters)
+glitch_rot_spike_frob: 0.99     # single-frame wrist-rotation Frobenius delta
+extractor_args:
+  gcs_prefix: gs://foundational-research/hoi-dataset/EgoVerse/processed_v3
+  sources: [aria]  # extend to [abc, aria, eva] for the full build
+  quat_order: wxyz
+  camera: front_1
+  keypoint_tip_indices: [4, 8, 12, 16, 20]
+  pose_frame: world

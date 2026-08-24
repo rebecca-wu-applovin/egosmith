@@ -1,0 +1,26 @@
+# DexCap (partial mirror: 2 tasks). BLOCKER: both rawdata_*.zip objects on GCS are 0 bytes
+# (upload failure), so the chest-camera RGB + world-frame pose path is unavailable. This spec
+# targets the only usable artifact, the postprocessed robomimic HDF5
+# (hand_wiping_1-14_5actiongap_10000points.hdf5), streamed from GCS via gcsfs.
+# Per data/demo_N: obs/robot0_eef_pos (T,6)=two wrist xyz; obs/robot0_eef_quat (T,8)=two quats
+# (xyzw assumed); glove_states (T,63)=21x3 palm-frame joints of the gloved hand (wrist at row 0,
+# tips rows 4,8,12,16,20, verified hand-sized ~13-19 cm from wrist); states (T,16)=4x4 chest
+# camera c2w; obs/agentview_image (T,84,84,3) is the only RGB (low-res crop).
+# Known caveats stamped into descriptor.extra: fabricated nominal intrinsics (none exist in the
+# file -> projection gates not meaningful), mirrored palm offsets for the non-gloved hand,
+# unverified hand0/hand1 = left/right assignment. "5actiongap": obs are subsampled; effective
+# rate ~6 Hz (30 Hz capture / 5) -> --source_fps 6.
+dataset: dexcap
+source_id: dexcap
+split: train
+fps: 6.0
+lowdim_schema: dexcap_hdf5_robomimic_v1
+extractor: dexcap_hdf5
+presence_requires_projection: true  # nominal intrinsics never certify visibility -> presence stays 0, visibility gates skip, kinematic gates still run
+extractor_args:
+  gcs_url: gs://foundational-research/hoi-dataset/DexCap/hand_wiping_1-14_5actiongap_10000points.hdf5
+  hand_order: left_right
+  quat_order: xyzw
+  tip_rows: [4, 8, 12, 16, 20]
+  nominal_intr: [60.0, 60.0, 42.0, 42.0]
+  task: wiping

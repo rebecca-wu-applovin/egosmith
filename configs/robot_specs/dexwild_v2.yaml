@@ -1,0 +1,53 @@
+# DexWild robot spec v2 -- LEAP Hand V2 (left + right), xArm-mounted, in-the-wild teleop.
+# NEW FILE (v1 configs/robot_specs/dexwild.yaml left untouched per CAT4 new-files-only rule).
+#
+# WHY v2: v1's limits were calibrated on only 12 clothes_data episodes (its own header
+# warned "refresh with a larger sample before a full-dataset run"). The florist smoke
+# under v1 dropped 14/20 episodes at pos_limits with worst excesses of just 0.05-0.2 rad
+# beyond the envelope (violation fracs 0.7-8.6%) -- classic envelope-edge noise from an
+# undersized calibration sample, not glitches (teleports would trip hard_peak_ratio).
+#
+# v2 limit derivation (2026-08-20, CAT4 sweep):
+#   - Calibration sample: 20 clothes_data/robot episodes (qc_clothes_calib20) POOLED with
+#     20 florist_data/robot episodes (qc_florist_calib) -- union envelope across splits:
+#     pos_min = min(p0.1_clothes, p0.1_florist) - 0.15 rad
+#     pos_max = max(p99.9_clothes, p99.9_florist) + 0.15 rad
+#     max_vel = max over splits of p99.9(|dq/dt|) x 1.5, capped at 12 rad/s (v1 cap kept;
+#               a few joints' suggestions are glitch-polluted)
+#     max_acc = max over splits of p99.9(|d2q/dt2|) x 1.5, capped at 500 rad/s^2 (v1 cap)
+#   - dt ALWAYS from the per-sample ns timestamps in the data, never an assumed rate
+#     (~30 Hz effective, mean dt 33.4 ms).
+#   - Teleports/corrupt rows remain caught by hard_peak_ratio regardless of envelope width.
+# Gate thresholds unchanged from v1 except pos_limit.max_violation_frac stays at the
+# looser 0.005 (calibration sample still modest: 40 episodes of 543).
+#
+# DoF: left/right_leapv2 HDF5 datasets are (T,18) = 1 ns-timestamp column + 17 joint
+# values -> LEAP V2 hand = 17 DoF per hand (V2 adds palm articulation over V1's 16).
+# arm_eef / intergripper / manus streams are Cartesian/glove aux -> no joint-limit gates;
+# no commanded-joint stream in the robot HDF5 -> tracking gate disabled.
+robot: leapv2_bimanual_xarm
+dataset: dexwild
+spec_version: 2
+streams:
+  left_leapv2:
+    kind: measured
+    dof: 17
+    pos_min: [-0.952, -0.171, 0.008, -0.861, -0.046, 0.01, -0.784, 0.142, -0.037, -1.02, -0.018, -0.158, 0.608, -0.286, 0.014, -0.258, -0.705]
+    pos_max: [0.461, 1.272, 1.78, 0.778, 1.485, 1.513, 0.912, 1.733, 0.828, 0.997, 1.82, 1.103, 1.582, 0.444, 1.845, 1.173, 1.442]
+    max_vel: [3.92, 5.81, 3.41, 7.13, 11.39, 3.72, 8.65, 6.38, 3.52, 8.34, 8.57, 3.3, 2.12, 1.97, 2.67, 5.19, 12]
+    max_acc: [96.1, 217.2, 170.1, 370.4, 375.2, 197.9, 204, 247.8, 126.9, 222, 216, 87.3, 129.4, 64, 315.7, 107.4, 500]
+  right_leapv2:
+    kind: measured
+    dof: 17
+    pos_min: [-0.701, -0.054, 0.011, -0.522, -0.021, 0.108, -0.595, 0.012, 0.014, -0.882, -0.001, -0.162, -0.285, -0.25, -0.066, -0.225, -0.316]
+    pos_max: [0.122, 1.41, 1.326, 0.465, 1.568, 1.173, 0.508, 1.658, 1.019, 0.663, 1.653, 1.331, 1.739, 1.281, 2.089, 1.408, 1.66]
+    max_vel: [1.89, 7.61, 2.97, 2.32, 12, 5.57, 3.59, 7.19, 2.41, 6.46, 6.84, 2.26, 4.28, 2.81, 3.7, 4.77, 12]
+    max_acc: [230.7, 500, 500, 97, 500, 412.1, 500, 500, 217, 500, 500, 500, 402.5, 211, 276.3, 500, 500]
+gates:
+  pos_limit: {max_violation_frac: 0.005}
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 5}
+  health: {min_len_s: 2.0, max_stall_s: 10.0, stall_eps_rad_s: 0.005, max_nan_frac: 0.0, max_const_channel_frac: 0.6}
+  dedup: {downsample_hz: 5, quant: 0.01}

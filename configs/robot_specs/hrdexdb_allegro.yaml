@@ -1,0 +1,57 @@
+# HRDexDB spec -- Allegro slice ONLY (allegro_v5/; other embodiments inspire_dftp,
+# inspire_f1, human are EXCLUDED -- isolate by pointing --data_root at allegro_v5/).
+# DoF VERIFICATION: raw/hand/position.npy is (T,16) -> Allegro Hand 16-DoF CONFIRMED,
+#   with commanded targets raw/hand/action.npy (T,16) at the same clock -> tracking gate.
+#   raw/arm/position.npy is (T,6) -> 6-DoF arm (model unnamed in the release; UR-class).
+#   raw/arm/action.npy is (T,4,4) EEF pose commands -> no joint-space arm tracking gate.
+# Rates are MULTI-RATE: hand ~100 Hz, arm ~136 Hz, cameras 30 Hz -- every stream carries
+# its own Unix-time array (raw/*/time.npy); all dt comes from those timestamps.
+# timestamps/frame_id.npy gaps directly encode dropped camera frames (video_sync gate).
+# Limit derivation method (no manufacturer spec sheet available for this exact stack):
+#   - pos_min/pos_max = [p0.1 - 0.15 rad, p99.9 + 0.15 rad] of the sampled measured-joint
+#     distribution (sample sizes listed below). Positions outside this envelope indicate
+#     encoder glitches / retarget blowups rather than legitimate motion.
+#   - max_vel = per-joint p99.9(|dq/dt|) x 1.5, dt taken from the DATA (per-frame timestamps
+#     when present, else metadata fps). NEVER an assumed frame rate -- limits are
+#     velocity x frame-interval and a wrong fps silently rescales every limit.
+#   - max_acc = per-joint p99.9(|d2q/dt2|) x 1.5, same dt sourcing.
+#   - caps: where the p99.9x1.5 suggestion itself is polluted by glitches (>0.1% of frames
+#     jumping), a physical cap is applied instead and noted inline.
+# Calibration sample: 60 episodes across 12 objects.
+# Data envelope is consistent with published Allegro URDF limits up to channel ordering
+# (unverified against URDF joint order, so the data-driven envelope is used).
+robot: allegro_16dof_arm6
+dataset: hrdexdb_allegro
+license_note: "HRDexDB is CC-BY-NC-4.0 (non-commercial). Flagged for downstream use review."
+streams:
+  hand_position:
+    kind: measured
+    dof: 16
+    pos_min: [-0.231, -0.181, -0.153, -0.145, -0.258, -0.194, -0.043, -0.089, -0.287, -0.194, -0.158, -0.148, 0.38, -0.39, 0.086, -0.018]
+    pos_max: [0.31, 1.89, 2.03, 1.37, 0.236, 1.77, 2.05, 1.36, 0.227, 1.85, 2.03, 1.35, 2.02, 0.794, 1.25, 1.39]
+    max_vel: [1.37, 4.99, 10.3, 7.74, 1.38, 5.19, 8.88, 6.53, 1.37, 5.55, 9.94, 6.92, 6.21, 2.91, 4.45, 6.92]
+    max_acc: [114, 169.3, 356.1, 314.8, 109.2, 195.4, 356.1, 298.9, 113.7, 200.6, 389.6, 302.1, 206.2, 119.4, 182.6, 256.9]
+  hand_action:
+    kind: commanded
+    dof: 16
+  arm_position:
+    kind: measured
+    dof: 6
+    pos_min: [-0.895, -0.563, -2.24, 0.024, -1.41, 0.243]
+    pos_max: [0.667, 1.2, -0.162, 4.69, 1.92, 4.99]
+    max_vel: [1.01, 1.02, 1.23, 2.66, 2.07, 3.86]
+    max_acc: [74.7, 83, 91, 182.3, 138.8, 229.4]
+gates:
+  pos_limit: {max_violation_frac: 0.002}
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  # per-episode hand tracking rmse p99=0.114, p95err p99=0.269 on the sample
+  tracking: {pairs: [[hand_action, hand_position]], max_rmse: 0.18, max_p95: 0.42, allow_lag_frames: 3}
+  # arm_position timestamps carry systematic ROS-message jitter (~6.5% gaps + ~17 tiny
+  # non-monotonic steps in EVERY sampled episode) -> strict checks on hand stream only;
+  # camera dropped frames are covered by video_sync via frame_id gaps.
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02, streams: [hand_position]}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 5}
+  # grasp episodes legitimately hold still while lifting -> lenient stall bound
+  health: {min_len_s: 2.0, max_stall_s: 12.0, stall_eps_rad_s: 0.003, max_nan_frac: 0.0, max_const_channel_frac: 0.7}
+  dedup: {downsample_hz: 5, quant: 0.01}

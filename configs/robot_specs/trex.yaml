@@ -1,0 +1,43 @@
+# T-Rex robot spec -- Dexmate Vega-1 dual 7-DoF arms + 2x SharpaWave hands.
+# DoF VERIFICATION (from meta/info.json + data): observation.state is 58-d =
+#   7 left_arm + 22 left_hand + 7 right_arm + 22 right_hand.
+#   SharpaWave hand = 22 DoF CONFIRMED (left_hand_q_0..q_21 / right_hand_q_0..q_21).
+# fps: 30 (meta/info.json; LeRobot timestamp column steps at exactly 1/30 s).
+# Limit derivation method (no manufacturer spec sheet available for this exact stack):
+#   - pos_min/pos_max = [p0.1 - 0.15 rad, p99.9 + 0.15 rad] of the sampled measured-joint
+#     distribution (sample sizes listed below). Positions outside this envelope indicate
+#     encoder glitches / retarget blowups rather than legitimate motion.
+#   - max_vel = per-joint p99.9(|dq/dt|) x 1.5, dt taken from the DATA (per-frame timestamps
+#     when present, else metadata fps). NEVER an assumed frame rate -- limits are
+#     velocity x frame-interval and a wrong fps silently rescales every limit.
+#   - max_acc = per-joint p99.9(|d2q/dt2|) x 1.5, same dt sourcing.
+#   - caps: where the p99.9x1.5 suggestion itself is polluted by glitches (>0.1% of frames
+#     jumping), a physical cap is applied instead and noted inline.
+# Calibration sample: FULL dataset, 5464 episodes (all data/chunk-000 files).
+# (Initial 144-episode calibration under-covered the workspace: 12% of episodes
+#  sat 0.1+ rad outside that envelope for ~8% of frames; full-data p99.9 fixes it.)
+robot: dexmate_vega1_sharpa_wave
+dataset: trex
+streams:
+  state:
+    kind: measured
+    dof: 58
+    names: ["left_arm_q_0", "left_arm_q_1", "left_arm_q_2", "left_arm_q_3", "left_arm_q_4", "left_arm_q_5", "left_arm_q_6", "left_hand_q_0", "left_hand_q_1", "left_hand_q_2", "left_hand_q_3", "left_hand_q_4", "left_hand_q_5", "left_hand_q_6", "left_hand_q_7", "left_hand_q_8", "left_hand_q_9", "left_hand_q_10", "left_hand_q_11", "left_hand_q_12", "left_hand_q_13", "left_hand_q_14", "left_hand_q_15", "left_hand_q_16", "left_hand_q_17", "left_hand_q_18", "left_hand_q_19", "left_hand_q_20", "left_hand_q_21", "right_arm_q_0", "right_arm_q_1", "right_arm_q_2", "right_arm_q_3", "right_arm_q_4", "right_arm_q_5", "right_arm_q_6", "right_hand_q_0", "right_hand_q_1", "right_hand_q_2", "right_hand_q_3", "right_hand_q_4", "right_hand_q_5", "right_hand_q_6", "right_hand_q_7", "right_hand_q_8", "right_hand_q_9", "right_hand_q_10", "right_hand_q_11", "right_hand_q_12", "right_hand_q_13", "right_hand_q_14", "right_hand_q_15", "right_hand_q_16", "right_hand_q_17", "right_hand_q_18", "right_hand_q_19", "right_hand_q_20", "right_hand_q_21"]
+    pos_min: [-0.562, -0.498, -0.746, -2.78, -2, -1.34, -1.52, -0.172, -0.546, -0.495, -0.455, -0.145, -0.327, -0.403, -0.146, -0.148, -0.326, -0.378, -0.143, -0.148, -0.327, -0.391, -0.147, -0.149, -0.143, -0.331, -0.357, -0.146, -0.148, -2.14, -1.59, -1.81, -2.83, -2.25, -1.55, -1.27, -0.177, -0.444, -0.484, -0.424, -0.146, -0.324, -0.414, -0.146, -0.149, -0.325, -0.375, -0.146, -0.148, -0.326, -0.382, -0.146, -0.148, -0.143, -0.324, -0.372, -0.146, -0.149]
+    pos_max: [2.11, 1.62, 1.92, -0.196, 2.24, 1.55, 1.27, 1.72, 0.448, 1.13, 0.356, 0.966, 1.48, 0.361, 1.57, 1.36, 1.56, 0.368, 1.73, 1.4, 1.56, 0.373, 1.71, 1.38, 0.298, 1.33, 0.392, 1.72, 1.38, 0.466, 0.495, 0.696, -0.212, 1.67, 1.15, 1.45, 1.67, 0.362, 0.978, 0.342, 1.02, 1.44, 0.364, 1.55, 1.26, 1.5, 0.381, 1.71, 1.39, 1.53, 0.37, 1.72, 1.39, 0.309, 1.41, 0.372, 1.72, 1.04]
+    # max_vel capped at 8 rad/s (finger joints); suggestions ranged 0.8-5.1 rad/s
+    max_vel: [1.56, 1.29, 1.67, 1.94, 2.72, 2.21, 2.42, 2.83, 1.44, 5.27, 1.55, 2.88, 2.79, 1.12, 2.46, 2.45, 2.52, 0.887, 2.57, 2.58, 2.6, 0.849, 2.49, 2.46, 1.65, 2.14, 0.967, 4.39, 2.35, 1.46, 1.29, 1.6, 1.87, 2.64, 2.3, 2.33, 3.26, 1.37, 3.59, 1.19, 2.68, 2.58, 1.03, 2.5, 2.5, 2.34, 1.02, 2.67, 2.6, 2.06, 0.764, 2.64, 2.76, 1.69, 2.59, 0.887, 4.48, 2.29]
+    max_acc: [54.5, 44.8, 56.5, 68.1, 100, 78.7, 86.6, 40.9, 27.7, 58.5, 26.5, 50.3, 41.5, 21.3, 47, 49.7, 37.8, 16.6, 49.9, 52.1, 39.9, 15.3, 46.1, 48.9, 43.4, 37.3, 16.3, 58.7, 45.4, 50.7, 44.5, 55, 64.9, 95.4, 82.2, 82.9, 48, 26.2, 50.8, 18.8, 49.6, 36.9, 20.7, 47.6, 49.1, 33.6, 18.8, 50.6, 50.9, 28.5, 15.8, 49.5, 53.5, 47.4, 43.3, 16.6, 57.7, 44.8]
+  action:
+    kind: commanded
+    dof: 58
+gates:
+  pos_limit: {max_violation_frac: 0.002}
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  # tracking bounds from sample distribution: per-episode rmse p99=0.163, p95err p99=0.316
+  tracking: {pairs: [[action, state]], max_rmse: 0.25, max_p95: 0.50, allow_lag_frames: 3}
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 5}
+  health: {min_len_s: 2.0, max_stall_s: 10.0, stall_eps_rad_s: 0.005, max_nan_frac: 0.0, max_const_channel_frac: 0.6}
+  dedup: {downsample_hz: 5, quant: 0.01}

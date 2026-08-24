@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""Generic provided-keypoints -> native-feature WDS converter (Category-2 ingestion track).
+
+Converts datasets that ship per-frame hand keypoints / wrist poses (GT mocap, triangulated,
+or pseudo-labels) into the same native-feature WDS clips that ``generate_egodex_wds.py``
+produces: per-frame ``.image.jpg`` + ``.lowdim.npy`` (116-d) + ``.mano.npy`` (zeros 2x55)
++ ``.meta.json`` packed into one tar per clip, with
+``descriptor.extra["native_feature_source"] = "wds_lowdim_mano_v1"`` so the quality filter
+runs with ``--stages native_features``.
+
+The dataset-specific part lives in a **spec** (YAML under ``configs/keypoint_specs/<ds>.yaml``
+or a python dict) that declares:
+
+  extractor:        one of the registered extractor plugins below
+  extractor_args:   plugin kwargs (GCS layout, array keys, joint indices, unit scale, ...)
+  fps:              real capture fps of the frames+poses (pass to the filter as --source_fps)
+  source_id/split:  manifest bookkeeping
+
+Each extractor returns a normalized ``EpisodeData`` dict (all world-frame, meters):
+
+  lw_t (T,3) / rw_t (T,3)      wrist translations (MANO-joint-0-like point)
+  lw_R (T,3,3) / rw_R (T,3,3)  wrist rotations (rot6d = first two columns)
+  ltips / rtips (T,5,3)        thumb..little fingertip positions
+  valid_l / valid_r (T,)       bool per-frame hand validity -> presence bitmask
+  w2c (T,4,4)                  world->camera extrinsics
+  intr (4,)                    fx, fy, cx, cy
+  frames                       dict(mode="mp4", path=...) | dict(mode="jpeg_list", jpegs=[bytes])
+                               | dict(mode="placeholder", width=, height=)
+  task / desc                  strings for the manifest
+
+Missing-hand convention (motion/camera-space gates in quality/accumulator.py are
+presence-blind, so raw zeros would fake >9 m/s glitches):
+  * presence bit is OFF for every invalid frame (the filter's projection gates skip
+    non-visible hands via presence);
+  * invalid spans are forward/backward filled from the nearest valid pose so
+    per-frame steps stay zero across gaps;
+  * a hand that is never valid in the episode is parked 0.4 m in front of the camera
+    with identity rotation (keeps rot6d structurally valid and camera-space abs small).
+
+Frame/pose length mismatches are truncated to the shorter of the two, like the EgoDex
+template. All GCS access goes through gsutil; episodes are staged to a temp dir per worker.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from multiprocessing import get_context
+from pathlib import Path
+
+import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for _p in (str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+FINGERTIP_INDICES = [4, 8, 12, 16, 20]  # OpenPose-order MANO joints (exporters/mano_features.py)
+
+
+# --------------------------------------------------------------------------------------
+# small math helpers
+# --------------------------------------------------------------------------------------
+
+def _rot6d(R: np.ndarray) -> np.ndarray:
+    return np.concatenate([R[:, 0], R[:, 1]]).astype(np.float32)
+
+
+def _aa_to_rotmat(aa: np.ndarray) -> np.ndarray:
+    """Rodrigues for a batch (T,3) -> (T,3,3)."""
+    aa = np.asarray(aa, np.float64)
+    theta = np.linalg.norm(aa, axis=-1, keepdims=True)  # (T,1)
+    small = theta[..., 0] < 1e-8
+    axis = np.where(theta > 1e-8, aa / np.maximum(theta, 1e-12), 0.0)
+    x, y, z = axis[..., 0], axis[..., 1], axis[..., 2]
+    zeros = np.zeros_like(x)
+    K = np.stack([zeros, -z, y, z, zeros, -x, -y, x, zeros], axis=-1).reshape(-1, 3, 3)
+    th = theta.reshape(-1, 1, 1)
+    R = np.eye(3)[None] + np.sin(th) * K + (1 - np.cos(th)) * (K @ K)
+    R[small] = np.eye(3)
+    return R
+
+
+def _quat_to_rotmat(q: np.ndarray, order: str) -> np.ndarray:
+    """(T,4) quaternion -> (T,3,3). order in {"wxyz", "xyzw"}."""
+    q = np.asarray(q, np.float64)
+    if order == "xyzw":
+        x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    elif order == "wxyz":
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    else:
+        raise ValueError(f"bad quat order {order}")
+    n = np.sqrt(w * w + x * x + y * y + z * z)
+    n = np.maximum(n, 1e-12)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    R = np.empty((q.shape[0], 3, 3), np.float64)
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z); R[:, 0, 1] = 2 * (x * y - z * w); R[:, 0, 2] = 2 * (x * z + y * w)
+    R[:, 1, 0] = 2 * (x * y + z * w); R[:, 1, 1] = 1 - 2 * (x * x + z * z); R[:, 1, 2] = 2 * (y * z - x * w)
+    R[:, 2, 0] = 2 * (x * z - y * w); R[:, 2, 1] = 2 * (y * z + x * w); R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return R
+
+
+def _invert_se3(T: np.ndarray) -> np.ndarray:
+    out = np.tile(np.eye(4), (T.shape[0], 1, 1))
+    R = T[:, :3, :3]
+    out[:, :3, :3] = np.transpose(R, (0, 2, 1))
+    out[:, :3, 3] = -np.einsum("tji,tj->ti", R, T[:, :3, 3])
+    return out
+
+
+def _wrist_frame_from_keypoints(wrist: np.ndarray, mcp_middle: np.ndarray, mcp_index: np.ndarray) -> np.ndarray:
+    """Deterministic wrist SO3 from keypoints (datasets without wrist rotation, e.g. AssemblyHands).
+
+    x = wrist->middle-MCP; z = x cross (wrist->index-MCP); y = z cross x. Falls back to
+    identity when the points are degenerate. Returns (T,3,3)."""
+    T = wrist.shape[0]
+    R = np.tile(np.eye(3), (T, 1, 1))
+    ex = mcp_middle - wrist
+    helper = mcp_index - wrist
+    nx = np.linalg.norm(ex, axis=1)
+    ok = nx > 1e-6
+    ex[ok] /= nx[ok, None]
+    ez = np.cross(ex, helper)
+    nz = np.linalg.norm(ez, axis=1)
+    ok = ok & (nz > 1e-6)
+    ez[ok] /= nz[ok, None]
+    ey = np.cross(ez, ex)
+    R[ok, :, 0] = ex[ok]
+    R[ok, :, 1] = ey[ok]
+    R[ok, :, 2] = ez[ok]
+    return R
+
+
+def _fill_missing_hand(t, R, tips, valid, w2c):
+    """Apply the missing-hand convention documented in the module docstring (in-place copies)."""
+    T = t.shape[0]
+    valid = np.asarray(valid, bool)
+    t = t.copy(); R = R.copy(); tips = tips.copy()
+    if valid.any():
+        idx = np.arange(T)
+        vidx = idx[valid]
+        # nearest valid index per frame (ffill then bfill semantics via searchsorted midpoint)
+        pos = np.searchsorted(vidx, idx).clip(0, len(vidx) - 1)
+        prev = vidx[np.maximum(pos - 1, 0)]
+        nxt = vidx[pos]
+        take_prev = (idx - prev) <= np.abs(nxt - idx)
+        nearest = np.where(take_prev & (prev <= idx), prev, nxt)
+        nearest[valid] = idx[valid]
+        t = t[nearest]; R = R[nearest]; tips = tips[nearest]
+    else:
+        c2w = np.linalg.inv(w2c)
+        park_cam = np.array([0.0, 0.0, 0.4, 1.0])
+        park_world = np.einsum("tij,j->ti", c2w, park_cam)[:, :3]
+        t = park_world
+        R = np.tile(np.eye(3), (T, 1, 1))
+        tips = np.tile(park_world[:, None, :], (1, 5, 1))
+    return t, R, tips
+
+
+# --------------------------------------------------------------------------------------
+# GCS helpers
+# --------------------------------------------------------------------------------------
+
+def _gsutil(args, **kw):
+    return subprocess.run(["gsutil", "-q"] + args, check=True, capture_output=True, **kw)
+
+
+def gcs_list(prefix: str) -> list[str]:
+    out = subprocess.run(["gsutil", "ls", prefix], check=True, capture_output=True, text=True)
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def gcs_download(url: str, dest: Path, recursive: bool = False):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    args = ["-m", "cp"] + (["-r"] if recursive else []) + [url, str(dest)]
+    _gsutil(args)
+
+
+# --------------------------------------------------------------------------------------
+# minimal zarr-v3 reader (sharding_indexed + bytes/zstd), enough for EgoVerse pose arrays
+# --------------------------------------------------------------------------------------
+
+def read_zarr3_array(array_dir: Path) -> np.ndarray:
+    meta = json.loads((array_dir / "zarr.json").read_text())
+    assert meta["zarr_format"] == 3 and meta["node_type"] == "array"
+    shape = tuple(meta["shape"])
+    dtype = np.dtype(meta["data_type"])
+    outer = tuple(meta["chunk_grid"]["configuration"]["chunk_shape"])
+    sep = meta["chunk_key_encoding"]["configuration"].get("separator", "/")
+    fill = meta.get("fill_value", 0)
+    codecs = meta["codecs"]
+    assert len(codecs) == 1 and codecs[0]["name"] == "sharding_indexed", f"unsupported codecs {codecs}"
+    cfg = codecs[0]["configuration"]
+    inner = tuple(cfg["chunk_shape"])
+    inner_codecs = [c["name"] for c in cfg["codecs"]]
+    assert inner_codecs[0] == "bytes", f"unsupported inner codecs {inner_codecs}"
+    use_zstd = "zstd" in inner_codecs
+    assert cfg.get("index_location", "end") == "end"
+    if use_zstd:
+        from numcodecs import Zstd
+        zstd = Zstd()
+
+    out = np.full(shape, fill, dtype=dtype)
+    n_outer = [int(np.ceil(s / c)) for s, c in zip(shape, outer)]
+    n_inner_per_outer = [int(np.ceil(o / i)) for o, i in zip(outer, inner)]
+    n_inner_total = int(np.prod(n_inner_per_outer))
+
+    for outer_idx in np.ndindex(*n_outer):
+        chunk_path = array_dir / "c" / sep.join(str(i) for i in outer_idx)
+        if not chunk_path.is_file():
+            continue
+        blob = chunk_path.read_bytes()
+        index_size = n_inner_total * 16 + 4  # (offset,u64)+(nbytes,u64) per inner chunk + crc32c
+        index = blob[-index_size:-4]
+        for flat, inner_idx in enumerate(np.ndindex(*n_inner_per_outer)):
+            off, nb = struct.unpack_from("<QQ", index, flat * 16)
+            if off == 0xFFFFFFFFFFFFFFFF:
+                continue
+            raw = blob[off: off + nb]
+            if use_zstd:
+                raw = zstd.decode(raw)
+            arr = np.frombuffer(raw, dtype=dtype.newbyteorder("<")).reshape(inner)
+            starts = [oi * o + ii * i for oi, o, ii, i in zip(outer_idx, outer, inner_idx, inner)]
+            sl, asl = [], []
+            for s, i_sz, dim in zip(starts, inner, shape):
+                stop = min(s + i_sz, dim)
+                sl.append(slice(s, stop)); asl.append(slice(0, stop - s))
+            out[tuple(sl)] = arr[tuple(asl)]
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# extractor plugins
+# --------------------------------------------------------------------------------------
+
+class HaworNpzExtractor:
+    """OpenAoE-style HaWoR pseudo-labels: per-episode dir on GCS holding
+
+        ego_process/ego_hands_reconstruction/hands.npz      (pred_trans/rot/hand_pose/betas/valid, R_w2c/t_w2c)
+        ego_process/ego_undistorted_video/raw_video_undistorted.mp4 + undistorted_video_info.json
+
+    Wrist translation = MANO joint-0 world (matches the pipeline's wrist_translation_semantics);
+    fingertips from the MANO forward pass (run_mano_twohands), wrist rotation from pred_rot."""
+
+    def __init__(self, gcs_prefix, hands_rel="ego_process/ego_hands_reconstruction/hands.npz",
+                 video_rel="ego_process/ego_undistorted_video/raw_video_undistorted.mp4",
+                 video_info_rel="ego_process/ego_undistorted_video/undistorted_video_info.json",
+                 valid_thresh=0.5, use_cuda=True):
+        self.gcs_prefix = gcs_prefix.rstrip("/")
+        self.hands_rel = hands_rel
+        self.video_rel = video_rel
+        self.video_info_rel = video_info_rel
+        self.valid_thresh = float(valid_thresh)
+        self.use_cuda = bool(use_cuda)
+
+    def list_episodes(self, limit=None):
+        eps = [u.rstrip("/") for u in gcs_list(self.gcs_prefix + "/") if u.endswith("/")]
+        eps.sort()
+        return eps[:limit] if limit else eps
+
+    def load(self, episode_url: str, work: Path) -> dict:
+        name = episode_url.rstrip("/").split("/")[-1]
+        gcs_download(f"{episode_url}/{self.hands_rel}", work / "hands.npz")
+        gcs_download(f"{episode_url}/{self.video_info_rel}", work / "video_info.json")
+        gcs_download(f"{episode_url}/{self.video_rel}", work / "video.mp4")
+        d = np.load(work / "hands.npz")
+        info = json.loads((work / "video_info.json").read_text())
+        cam = info["cameraParams"]
+        intr = np.array([cam["fx_pixels"], cam["fy_pixels"], cam["cx_pixels"], cam["cy_pixels"]], np.float32)
+        fps = float(info.get("fps", 30))
+
+        pred_trans = d["pred_trans"]      # (2,T,3) world  [0]=left [1]=right
+        pred_rot = d["pred_rot"]          # (2,T,3) axis-angle world
+        pred_pose = d["pred_hand_pose"]   # (2,T,45)
+        pred_betas = d["pred_betas"]      # (2,T,10)
+        valid = d["pred_valid"] > self.valid_thresh  # (2,T)
+        T = pred_trans.shape[1]
+        w2c = np.tile(np.eye(4), (T, 1, 1))
+        w2c[:, :3, :3] = d["R_w2c"]
+        w2c[:, :3, 3] = d["t_w2c"]
+
+        import torch
+        from lib.pipeline.hands.mano_runtime import run_mano_twohands
+        with torch.inference_mode():
+            joints = run_mano_twohands(
+                torch.from_numpy(pred_trans).float(),
+                torch.from_numpy(pred_rot).float(),
+                torch.from_numpy(pred_pose).float(),
+                None,
+                torch.from_numpy(pred_betas).float(),
+                use_cuda=self.use_cuda,
+            )["joints"].cpu().numpy()  # (2,T,21,3) world
+        lw_R = _aa_to_rotmat(pred_rot[0])
+        rw_R = _aa_to_rotmat(pred_rot[1])
+        return dict(
+            lw_t=joints[0, :, 0], rw_t=joints[1, :, 0],
+            lw_R=lw_R, rw_R=rw_R,
+            ltips=joints[0][:, FINGERTIP_INDICES], rtips=joints[1][:, FINGERTIP_INDICES],
+            valid_l=valid[0], valid_r=valid[1],
+            w2c=w2c, intr=intr, fps=fps,
+            frames=dict(mode="mp4", path=str(work / "video.mp4")),
+            task=name, desc="", episode_name=name,
+        )
+
+
+class EgoverseZarr3Extractor:
+    """EgoVerse processed_v3: per-clip ``<stamp>.zarr`` (zarr v3, sharded+zstd) + sibling
+    ``<stamp>.mp4``. Uses left/right ``obs_wrist_pose`` (xyz+quat), ``obs_keypoints``
+    (21x3 world, tips at 4,8,12,16,20), ``obs_head_pose`` as the camera c2w, and
+    ``attributes.intrinsics[camera]``."""
+
+    def __init__(self, gcs_prefix, sources=("aria",), quat_order="wxyz", camera="front_1",
+                 keypoint_tip_indices=(4, 8, 12, 16, 20), pose_frame="world"):
+        self.gcs_prefix = gcs_prefix.rstrip("/")
+        self.sources = list(sources)
+        self.quat_order = quat_order
+        self.camera = camera
+        self.tip_idx = list(keypoint_tip_indices)
+        assert pose_frame == "world"
+
+    def list_episodes(self, limit=None):
+        eps = []
+        for src in self.sources:
+            for u in gcs_list(f"{self.gcs_prefix}/{src}/"):
+                if u.endswith(".zarr/"):
+                    eps.append(u.rstrip("/"))
+            if limit and len(eps) >= limit:
+                break
+        eps.sort()
+        return eps[:limit] if limit else eps
+
+    def load(self, episode_url: str, work: Path) -> dict:
+        stem = episode_url.rsplit("/", 1)[-1][: -len(".zarr")]
+        src = episode_url.rstrip("/").split("/")[-2]
+        zdir = work / "z"
+        zdir.mkdir(parents=True, exist_ok=True)
+        gcs_download(f"{episode_url}/zarr.json", zdir / "zarr.json")
+        arrays = ["left.obs_wrist_pose", "right.obs_wrist_pose", "left.obs_keypoints",
+                  "right.obs_keypoints", "obs_head_pose"]
+        for a in arrays:
+            gcs_download(f"{episode_url}/{a}", zdir, recursive=True)
+        gcs_download(f"{episode_url.rsplit('/',1)[0]}/{stem}.mp4", work / "video.mp4")
+
+        root = json.loads((zdir / "zarr.json").read_text())
+        attrs = root["attributes"]
+        fps = float(attrs.get("fps", 30))
+        K = np.array(attrs["intrinsics"][self.camera], np.float64)
+        intr = np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]], np.float32)
+
+        def arr(name):
+            return read_zarr3_array(zdir / name)
+
+        lw = arr("left.obs_wrist_pose"); rw = arr("right.obs_wrist_pose")
+        lk = arr("left.obs_keypoints").reshape(-1, 21, 3)
+        rk = arr("right.obs_keypoints").reshape(-1, 21, 3)
+        head = arr("obs_head_pose")
+        T = min(len(lw), len(rw), len(lk), len(rk), len(head))
+        lw, rw, lk, rk, head = lw[:T], rw[:T], lk[:T], rk[:T], head[:T]
+
+        c2w = np.tile(np.eye(4), (T, 1, 1))
+        c2w[:, :3, :3] = _quat_to_rotmat(head[:, 3:7], self.quat_order)
+        c2w[:, :3, 3] = head[:, :3]
+        w2c = _invert_se3(c2w)
+
+        # validity: all-zero rows mean no track
+        valid_l = np.abs(lk).sum(axis=(1, 2)) > 1e-8
+        valid_r = np.abs(rk).sum(axis=(1, 2)) > 1e-8
+        return dict(
+            lw_t=lw[:, :3], rw_t=rw[:, :3],
+            lw_R=_quat_to_rotmat(lw[:, 3:7], self.quat_order),
+            rw_R=_quat_to_rotmat(rw[:, 3:7], self.quat_order),
+            ltips=lk[:, self.tip_idx], rtips=rk[:, self.tip_idx],
+            valid_l=valid_l, valid_r=valid_r,
+            w2c=w2c, intr=intr, fps=fps,
+            frames=dict(mode="mp4", path=str(work / "video.mp4")),
+            task=attrs.get("task_name", src), desc=attrs.get("task_description", ""),
+            episode_name=f"{src}_{stem}",
+        )
+
+
+class AssemblyHandsExtractor:
+    """AssemblyHands ego annotations (triangulated 3D keypoints, world frame, **millimeters**).
+
+    One clip per (seq_name, ego camera). joint_3d gives 42x3 world_coord (right 0..20,
+    left 21..41; tips are *4 rows: right [0,4,8,12,16], left [21,25,29,33,37]; wrists 20/41).
+    ego_calib gives per-seq per-camera K (3x3) and per-frame per-camera w2c (3x4, mm).
+    Wrist rotation is derived from keypoints (see _wrist_frame_from_keypoints).
+
+    The rectified ego images (ego_images_rectified/...) are NOT present under the GCS
+    prefix; the raw ego videos live in Assembly101/recordings/<seq_name>/<camera>_mono10bit.mp4
+    (60 fps; annotation frame_idx indexes those video frames). Set
+    ``assembly101_video_prefix`` to join them (frames are seek-extracted per frame_idx),
+    else ``frames.mode`` falls back to ``placeholder``. NOTE: the raw HMC videos are
+    unrectified while the calib intrinsics describe the rectified images, so joined pixels
+    are approximate — fine for kinematic gates, not for pixel-accurate overlay."""
+
+    R_TIPS = [0, 4, 8, 12, 16]; R_MCP = {"middle": 11, "index": 7}; R_WRIST = 20
+    L_TIPS = [21, 25, 29, 33, 37]; L_MCP = {"middle": 32, "index": 28}; L_WRIST = 41
+
+    def __init__(self, gcs_prefix, split="val", version="v1-1", images_root=None,
+                 assembly101_video_prefix=None, min_valid_tips=3, unit_scale=0.001,
+                 max_frames_per_clip=None):
+        self.gcs_prefix = gcs_prefix.rstrip("/")
+        self.split = split
+        self.version = version
+        self.images_root = images_root
+        self.assembly101_video_prefix = (assembly101_video_prefix.rstrip("/")
+                                         if assembly101_video_prefix else None)
+        self.min_valid_tips = int(min_valid_tips)
+        self.unit_scale = float(unit_scale)
+        self.max_frames_per_clip = max_frames_per_clip
+        self._cache = {}
+
+    def _annos(self, work: Path):
+        if "data" in self._cache:
+            return self._cache["data"]
+        base = f"{self.gcs_prefix}/annotations/{self.split}"
+        names = {k: f"assemblyhands_{self.split}_{k}_{self.version}.json"
+                 for k in ("ego_data", "joint_3d", "ego_calib")}
+        local = work.parent / "_ah_annotations"
+        local.mkdir(parents=True, exist_ok=True)
+        out = {}
+        for k, n in names.items():
+            p = local / n
+            if not p.is_file():
+                gcs_download(f"{base}/{n}", p)
+            out[k] = json.loads(p.read_text())
+        self._cache["data"] = out
+        return out
+
+    def list_episodes(self, limit=None):
+        # episode ref = "seq_name::camera"; enumeration needs the ego_data json
+        work = Path(tempfile.mkdtemp(prefix="ah_list_"))
+        data = self._annos(work / "x")
+        pairs = sorted({(im["seq_name"], im["camera"]) for im in data["ego_data"]["images"]})
+        refs = [f"{s}::{c}" for s, c in pairs]
+        return refs[:limit] if limit else refs
+
+    def load(self, episode_ref: str, work: Path) -> dict:
+        seq, camera = episode_ref.split("::")
+        data = self._annos(work)
+        ims = [im for im in data["ego_data"]["images"]
+               if im["seq_name"] == seq and im["camera"] == camera]
+        ims.sort(key=lambda im: im["frame_idx"])
+        joints = data["joint_3d"]["annotations"][seq]
+        calib = data["ego_calib"]["calibration"][seq]
+        cam_key = camera if camera in calib["intrinsics"] else f"{camera}_mono10bit"
+        K = np.array(calib["intrinsics"][cam_key], np.float64)
+        intr = np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]], np.float32)
+
+        rows = []
+        for im in ims:
+            fkey = f"{im['frame_idx']:06d}"
+            if fkey in joints and fkey in calib["extrinsics"]:
+                rows.append((im, fkey))
+        if len(rows) < 3:
+            raise ValueError(f"too few annotated frames for {episode_ref}: {len(rows)}")
+        if self.max_frames_per_clip:
+            rows = rows[: int(self.max_frames_per_clip)]
+        T = len(rows)
+        wc = np.stack([np.array(joints[fk]["world_coord"], np.float64) for _, fk in rows]) * self.unit_scale
+        jv = np.stack([np.array(joints[fk]["joint_valid"], np.float64).reshape(-1) for _, fk in rows]) > 0.5
+        w2c = np.tile(np.eye(4), (T, 1, 1))
+        for i, (_, fk) in enumerate(rows):
+            E = np.array(calib["extrinsics"][fk][cam_key], np.float64)  # (3,4) world->cam, mm
+            w2c[i, :3, :3] = E[:, :3]
+            w2c[i, :3, 3] = E[:, 3] * self.unit_scale
+
+        def hand(tips_idx, wrist_idx, mcp):
+            t = wc[:, wrist_idx]
+            tips = wc[:, tips_idx]
+            R = _wrist_frame_from_keypoints(t, wc[:, mcp["middle"]], wc[:, mcp["index"]])
+            valid = jv[:, wrist_idx] & (jv[:, tips_idx].sum(axis=1) >= self.min_valid_tips)
+            return t, R, tips, valid
+
+        rt, rR, rtips, rvalid = hand(self.R_TIPS, self.R_WRIST, self.R_MCP)
+        lt, lR, ltips, lvalid = hand(self.L_TIPS, self.L_WRIST, self.L_MCP)
+
+        w0, h0 = ims[0]["width"], ims[0]["height"]
+        frames = dict(mode="placeholder", width=int(w0), height=int(h0), count=T)
+        extra = {"image_placeholder": True}
+        if self.images_root:
+            jpegs = []
+            for im, _ in rows:
+                p = Path(self.images_root) / im["file_name"]
+                jpegs.append(p.read_bytes())
+            frames = dict(mode="jpeg_list", jpegs=jpegs)
+            extra = {}
+        elif self.assembly101_video_prefix:
+            import cv2
+            vurl = f"{self.assembly101_video_prefix}/{seq}/{camera}_mono10bit.mp4"
+            vpath = work / "ego.mp4"
+            gcs_download(vurl, vpath)
+            cap = cv2.VideoCapture(str(vpath))
+            jpegs, last = [], None
+            for im, _ in rows:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(im["frame_idx"]))
+                ok, frame = cap.read()
+                if ok:
+                    frame = cv2.resize(frame, (int(w0), int(h0)))
+                    ok2, buf = cv2.imencode(".jpg", frame)
+                    last = bytes(buf) if ok2 else last
+                if last is None:
+                    raise ValueError(f"cannot read frame {im['frame_idx']} from {vurl}")
+                jpegs.append(last)
+            cap.release()
+            frames = dict(mode="jpeg_list", jpegs=jpegs)
+            extra = {"image_source": "assembly101_recordings_unrectified"}
+        # effective annotated rate: frame_idx steps by 2 at 1/30 s -> 30 fps effective
+        ts = [im["timestamp"] for im, _ in rows]
+        fps = float(1.0 / np.median(np.diff(ts))) if len(ts) > 2 else 30.0
+        return dict(
+            lw_t=lt, rw_t=rt, lw_R=lR, rw_R=rR, ltips=ltips, rtips=rtips,
+            valid_l=lvalid, valid_r=rvalid, w2c=w2c, intr=intr, fps=fps,
+            frames=frames, task=seq, desc="", episode_name=f"{seq}_{camera}",
+            extra=extra,
+        )
+
+
+class DexcapHdf5Extractor:
+    """DexCap postprocessed robomimic HDF5 (the raw zips on GCS are 0-byte, so this is the
+    only usable path). Streams demos straight from GCS via gcsfs; never downloads the file.
+
+    Layout per ``data/demo_N``:
+      obs/robot0_eef_pos  (T,6)  two wrist translations  [hand0 xyz, hand1 xyz]
+      obs/robot0_eef_quat (T,8)  two wrist quaternions (xyzw assumed, scipy/robomimic default)
+      glove_states        (T,63) 21x3 palm-frame joints for the gloved (right) hand,
+                                 wrist at origin, tips at rows 4,8,12,16,20
+      obs/agentview_image (T,84,84,3) chest-camera crop (only RGB available)
+      states              (T,16) 4x4 chest-camera pose (c2w assumed)
+
+    Caveats (recorded into descriptor.extra):
+      * no camera intrinsics anywhere -> nominal intrinsic is fabricated (projection gates
+        are not meaningful; kinematic gates are);
+      * only one glove -> the non-gloved hand reuses mirrored palm offsets (x negated);
+      * hand0/hand1 -> left/right assignment follows ``hand_order`` and is unverified.
+    """
+
+    def __init__(self, gcs_url, hand_order="left_right", quat_order="xyzw",
+                 tip_rows=(4, 8, 12, 16, 20), nominal_intr=(60.0, 60.0, 42.0, 42.0),
+                 image_key="obs/agentview_image", task="dexcap"):
+        self.gcs_url = gcs_url
+        self.hand_order = hand_order
+        self.quat_order = quat_order
+        self.tip_rows = list(tip_rows)
+        self.nominal_intr = np.asarray(nominal_intr, np.float32)
+        self.image_key = image_key
+        self.task = task
+
+    def _open(self):
+        import gcsfs, h5py
+        fs = gcsfs.GCSFileSystem()
+        fobj = fs.open(self.gcs_url, "rb", block_size=4 * 1024 * 1024)
+        return h5py.File(fobj, "r")
+
+    def list_episodes(self, limit=None):
+        with self._open() as h:
+            demos = sorted(h["data"].keys(), key=lambda k: int(k.split("_")[1]))
+        return demos[:limit] if limit else demos
+
+    def load(self, episode_ref: str, work: Path) -> dict:
+        import cv2
+        with self._open() as h:
+            d = h[f"data/{episode_ref}"]
+            eef_pos = d["obs/robot0_eef_pos"][:]
+            eef_quat = d["obs/robot0_eef_quat"][:]
+            glove = d["glove_states"][:].reshape(-1, 21, 3)
+            imgs = d[self.image_key][:]
+            states = d["states"][:]
+        T = min(len(eef_pos), len(glove), len(imgs), len(states))
+        eef_pos, eef_quat, glove, imgs, states = (a[:T] for a in (eef_pos, eef_quat, glove, imgs, states))
+
+        h0_t, h1_t = eef_pos[:, 0:3], eef_pos[:, 3:6]
+        h0_R = _quat_to_rotmat(eef_quat[:, 0:4], self.quat_order)
+        h1_R = _quat_to_rotmat(eef_quat[:, 4:8], self.quat_order)
+        if self.hand_order == "left_right":
+            lt, lR, rt, rR = h0_t, h0_R, h1_t, h1_R
+        else:
+            lt, lR, rt, rR = h1_t, h1_R, h0_t, h0_R
+
+        tips_palm = glove[:, self.tip_rows]                       # (T,5,3) gloved (right) hand
+        tips_palm_mirror = tips_palm * np.array([-1.0, 1.0, 1.0])  # crude left approximation
+        rtips = np.einsum("tij,tkj->tki", rR, tips_palm) + rt[:, None]
+        ltips = np.einsum("tij,tkj->tki", lR, tips_palm_mirror) + lt[:, None]
+
+        c2w = states.reshape(T, 4, 4)
+        w2c = _invert_se3(c2w)
+        jpgs = []
+        for t in range(T):
+            ok, buf = cv2.imencode(".jpg", imgs[t][..., ::-1])
+            jpgs.append(bytes(buf))
+        valid = np.ones(T, bool)
+        return dict(
+            lw_t=lt, rw_t=rt, lw_R=lR, rw_R=rR, ltips=ltips, rtips=rtips,
+            valid_l=valid, valid_r=valid, w2c=w2c, intr=self.nominal_intr,
+            fps=None, frames=dict(mode="jpeg_list", jpegs=jpgs),
+            task=self.task, desc="", episode_name=f"{self.task}_{episode_ref}",
+            extra={"intrinsic_nominal": True, "left_tips_mirrored": True,
+                   "hand_order_assumed": self.hand_order},
+        )
+
+
+EXTRACTORS = {
+    "hawor_npz": HaworNpzExtractor,
+    "egoverse_zarr3": EgoverseZarr3Extractor,
+    "assemblyhands_coco": AssemblyHandsExtractor,
+    "dexcap_hdf5": DexcapHdf5Extractor,
+}
+
+
+# --------------------------------------------------------------------------------------
+# core: EpisodeData -> lowdim + tar + manifest record
+# --------------------------------------------------------------------------------------
+
+def _flag_tracker_glitches(t, R, tips, valid, jump_thresh_m=None, rot_spike_frob=None):
+    """Mark isolated single-frame tracker glitches invalid (returns updated valid mask).
+
+    Rationale: a tracker re-acquisition glitch is semantically a dropout that reports
+    garbage instead of absence, so it gets the same invalid->ffill treatment as missing
+    hands — we are NOT loosening the recon-tuned Stage-4 gates. Measured on EgoVerse aria:
+    wrist-rotation Frobenius spikes >0.99 occur on 0.32% of frames and 100% of them
+    co-locate with >=5 cm single-frame keypoint jumps.
+
+    A frame t is flagged only on the true single-frame-outlier signature: it is far
+    from BOTH neighbors AND its neighbors are close to EACH OTHER (the track "returns"),
+    per metric — translation (max of wrist + fingertip steps, meters) or wrist rotation
+    (Frobenius ||R[t]-R[t-1]||). The neighbor-return condition is what spares genuine
+    fast sustained motion: there, t-1 and t+1 are also far apart, so nothing is flagged.
+    (A both-sides-only rule without the return condition wholesale-invalidates fast
+    reaches, and the ffill then collapses them into giant mid-gap jumps — measured on
+    EgoVerse aria it made the funnel worse, 16% -> 3.6% segment keep.) Edge frames are
+    never flagged (no return evidence)."""
+    T = len(t)
+    v = np.asarray(valid, bool).copy()
+    if T < 3 or (not jump_thresh_m and not rot_spike_frob):
+        return v
+    bad = np.zeros(T, bool)
+    if jump_thresh_m:
+        thr = float(jump_thresh_m)
+        pts = np.concatenate([t[:, None, :], tips], axis=1)          # (T,6,3)
+        d_in = np.linalg.norm(pts[1:-1] - pts[:-2], axis=2).max(axis=1)   # t-1 -> t
+        d_out = np.linalg.norm(pts[2:] - pts[1:-1], axis=2).max(axis=1)   # t -> t+1
+        d_ret = np.linalg.norm(pts[2:] - pts[:-2], axis=2).max(axis=1)    # t-1 -> t+1
+        bad[1:-1] |= (d_in > thr) & (d_out > thr) & (d_ret < thr)
+    if rot_spike_frob:
+        thr = float(rot_spike_frob)
+        r_in = np.linalg.norm((R[1:-1] - R[:-2]).reshape(T - 2, 9), axis=1)
+        r_out = np.linalg.norm((R[2:] - R[1:-1]).reshape(T - 2, 9), axis=1)
+        r_ret = np.linalg.norm((R[2:] - R[:-2]).reshape(T - 2, 9), axis=1)
+        bad[1:-1] |= (r_in > thr) & (r_out > thr) & (r_ret < thr)
+    return v & ~bad
+
+
+def _projects_visible(t, tips, w2c, intr, image_size, margin_scale=1.3):
+    """Per-frame bool: does any of wrist+5 tips project inside margin_scale x image with z>0?
+
+    Used to refine presence from "tracked" to "visible in THIS camera" — headset trackers
+    (Aria) and multi-view triangulation keep labeling hands far outside the ego camera FOV,
+    which trips the filter's visible-*-severe-offscreen / out-of-frame gates."""
+    W, H = image_size
+    pts = np.concatenate([t[:, None, :], tips], axis=1)  # (T,6,3)
+    Xc = np.einsum("tij,tkj->tki", w2c[:, :3, :3], pts) + w2c[:, None, :3, 3]
+    z = Xc[..., 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = intr[0] * Xc[..., 0] / z + intr[2]
+        v = intr[1] * Xc[..., 1] / z + intr[3]
+    mx, my = (margin_scale - 1.0) * W / 2, (margin_scale - 1.0) * H / 2
+    ok = (z > 0.02) & (u >= -mx) & (u < W + mx) & (v >= -my) & (v < H + my)
+    return ok.any(axis=1)
+
+
+def _build_lowdim(ep: dict, T: int, image_size=None, presence_requires_projection=False) -> tuple[np.ndarray, np.ndarray]:
+    lw_t, lw_R, ltips = _fill_missing_hand(ep["lw_t"][:T], ep["lw_R"][:T], ep["ltips"][:T], ep["valid_l"][:T], ep["w2c"][:T])
+    rw_t, rw_R, rtips = _fill_missing_hand(ep["rw_t"][:T], ep["rw_R"][:T], ep["rtips"][:T], ep["valid_r"][:T], ep["w2c"][:T])
+    vis_l = ep["valid_l"][:T].astype(bool)
+    vis_r = ep["valid_r"][:T].astype(bool)
+    if presence_requires_projection and image_size is not None:
+        intr = np.asarray(ep["intr"], np.float64)
+        vis_l = vis_l & _projects_visible(lw_t, ltips, ep["w2c"][:T], intr, image_size)
+        vis_r = vis_r & _projects_visible(rw_t, rtips, ep["w2c"][:T], intr, image_size)
+    presence = vis_l.astype(np.uint8) | (vis_r.astype(np.uint8) << 1)
+
+    wrist_state = np.zeros((T, 18), np.float32)
+    hand_state = np.zeros((T, 30), np.float32)
+    wrist_state[:, 0:3] = lw_t
+    wrist_state[:, 3:6] = rw_t
+    for t in range(T):
+        wrist_state[t, 6:12] = _rot6d(lw_R[t])
+        wrist_state[t, 12:18] = _rot6d(rw_R[t])
+    hand_state[:, 0:15] = ltips.reshape(T, 15)
+    hand_state[:, 15:30] = rtips.reshape(T, 15)
+
+    lowdim = np.zeros((T, 116), np.float32)
+    nxt = np.minimum(np.arange(T) + 1, T - 1)
+    lowdim[:, 0:18] = wrist_state
+    lowdim[:, 18:48] = hand_state
+    lowdim[:, 48:66] = wrist_state[nxt]
+    lowdim[:, 66:96] = hand_state[nxt]
+    w2c = ep["w2c"][:T].copy()
+    w2c[:, 3, :] = [0, 0, 0, 1]
+    lowdim[:, 96:112] = w2c.reshape(T, 16).astype(np.float32)
+    lowdim[:, 112:116] = np.asarray(ep["intr"], np.float32)[None]
+    return lowdim, presence.astype(np.uint8)
+
+
+def _ffmpeg_bin() -> str:
+    import os
+    if os.environ.get("FFMPEG_BIN"):
+        return os.environ["FFMPEG_BIN"]
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _iter_frames(frames: dict, work: Path, jpeg_quality: int):
+    """Yield jpg bytes per frame index (ordered)."""
+    if frames["mode"] == "mp4":
+        out = work / "frames"
+        out.mkdir(exist_ok=True)
+        subprocess.run([_ffmpeg_bin(), "-nostdin", "-loglevel", "error", "-i", frames["path"],
+                        "-vsync", "0", "-q:v", str(jpeg_quality), "-start_number", "0",
+                        str(out / "f%06d.jpg")], check=True, capture_output=True)
+        return [p.read_bytes() for p in sorted(out.glob("f*.jpg"))]
+    if frames["mode"] == "jpeg_list":
+        return frames["jpegs"]
+    if frames["mode"] == "placeholder":
+        import cv2
+        img = np.full((frames["height"], frames["width"], 3), 128, np.uint8)
+        ok, buf = cv2.imencode(".jpg", img)
+        assert ok
+        return [bytes(buf)] * frames["count"]
+    raise ValueError(f"bad frames mode {frames['mode']}")
+
+
+def _slice_ep(ep: dict, s: int, e: int) -> dict:
+    """Slice the per-frame arrays of an EpisodeData dict to [s, e)."""
+    out = dict(ep)
+    for k in ("lw_t", "rw_t", "lw_R", "rw_R", "ltips", "rtips", "valid_l", "valid_r", "w2c"):
+        out[k] = ep[k][s:e]
+    return out
+
+
+def _write_clip_tar(sub_id, jpgs, lowdim, presence, frames_root, outputs_root):
+    """Write one sub-clip tar (template layout) and return sorted (frame_names, offsets)."""
+    tar_path = Path(frames_root) / f"{sub_id}.tar"
+    (Path(outputs_root) / sub_id).mkdir(parents=True, exist_ok=True)
+    mano = np.zeros((2, 55), np.float32)
+    tmp_tar = tar_path.with_suffix(".tar.tmp")
+    with tarfile.open(tmp_tar, "w") as tw:
+        for t in range(len(jpgs)):
+            key = f"{sub_id}_f{t:05d}"
+            members = [(f"{key}.image.jpg", jpgs[t])]
+            for suffix, arr in ((".lowdim.npy", lowdim[t]), (".mano.npy", mano)):
+                buf = io.BytesIO(); np.save(buf, arr)
+                members.append((f"{key}{suffix}", buf.getvalue()))
+            members.append((f"{key}.meta.json", json.dumps({"presence": int(presence[t])}).encode()))
+            for name, payload in members:
+                ti = tarfile.TarInfo(name); ti.size = len(payload)
+                tw.addfile(ti, io.BytesIO(payload))
+    tmp_tar.replace(tar_path)
+    fn, fo = [], []
+    with tarfile.open(tar_path, "r") as tr:
+        for m in tr:
+            if m.isfile() and m.name.endswith(".image.jpg"):
+                fn.append(m.name); fo.append([int(m.offset_data), int(m.size)])
+    order = sorted(range(len(fn)), key=lambda i: fn[i])
+    return [fn[i] for i in order], [fo[i] for i in order]
+
+
+def convert_episode(episode_ref: str, spec: dict, args) -> list[dict]:
+    """Convert one source episode; returns one result per emitted sub-clip.
+
+    With --segment_sec N > 0 the session is split into consecutive N-second segments
+    (clip_id suffix _segNN, one tar per segment — the generate_egocentric_wds.py _ivNN
+    pattern). lowdim is built per segment, so next-frame action copies clamp at segment
+    boundaries exactly like the template clamps at episode end. Trailing segments
+    shorter than --min_segment_sec are dropped."""
+    ds = spec["dataset"]
+    extractor = EXTRACTORS[spec["extractor"]](**spec.get("extractor_args", {}))
+    result = {"episode": episode_ref, "status": "ok"}
+    work = Path(tempfile.mkdtemp(prefix=f"{ds}_", dir=args.frames_root))
+    try:
+        ep = extractor.load(episode_ref, work)
+        clip_id = f"{ds}_{re.sub(r'[^A-Za-z0-9_.-]', '-', ep['episode_name'])}"
+        result["clip_id"] = clip_id
+        segmented = float(args.segment_sec or 0) > 0
+        first_tar = Path(args.frames_root) / (f"{clip_id}_seg00.tar" if segmented else f"{clip_id}.tar")
+        if args.resume and first_tar.is_file():
+            return [{**result, "status": "skipped"}]
+        jpgs = _iter_frames(ep["frames"], work, args.jpeg_quality)
+        T = min(len(jpgs), ep["lw_t"].shape[0], ep["w2c"].shape[0])
+        if T < 3:
+            raise ValueError(f"too few frames: poses={ep['lw_t'].shape[0]} imgs={len(jpgs)}")
+        image_size = None
+        try:
+            import cv2
+            img0 = cv2.imdecode(np.frombuffer(jpgs[0], np.uint8), cv2.IMREAD_COLOR)
+            image_size = (int(img0.shape[1]), int(img0.shape[0]))
+        except Exception:
+            pass
+        # Pre-clean tracker re-acquisition glitches ONCE on the full session (so segment
+        # boundaries keep real neighbors), before segmentation + ffill. See
+        # _flag_tracker_glitches for the rationale + measured defaults.
+        if spec.get("glitch_jump_thresh_m") or spec.get("glitch_rot_spike_frob"):
+            for tk, Rk, tipk, vk in (("lw_t", "lw_R", "ltips", "valid_l"),
+                                     ("rw_t", "rw_R", "rtips", "valid_r")):
+                ep[vk] = _flag_tracker_glitches(
+                    ep[tk][:T], ep[Rk][:T], ep[tipk][:T], ep[vk][:T],
+                    spec.get("glitch_jump_thresh_m"), spec.get("glitch_rot_spike_frob"))
+        fps = float(ep.get("fps") or spec.get("fps") or 30.0)
+        if segmented:
+            seg_len = max(3, int(round(float(args.segment_sec) * fps)))
+            min_len = max(3, int(round(float(args.min_segment_sec) * fps)))
+            bounds = [(s, min(s + seg_len, T)) for s in range(0, T, seg_len)]
+            bounds = [(s, e) for s, e in bounds if (e - s) >= min_len]
+        else:
+            bounds = [(0, T)]
+        results = []
+        for k, (s, e) in enumerate(bounds):
+            sub_id = f"{clip_id}_seg{k:02d}" if segmented else clip_id
+            sub_ep = _slice_ep(ep, s, e)
+            lowdim, presence = _build_lowdim(
+                sub_ep, e - s, image_size=image_size,
+                presence_requires_projection=bool(spec.get("presence_requires_projection", False)))
+            fn, fo = _write_clip_tar(sub_id, jpgs[s:e], lowdim, presence,
+                                     args.frames_root, args.outputs_root)
+            r = {"episode": episode_ref, "status": "ok", "clip_id": sub_id,
+                 "frames": e - s, "task": ep.get("task", ""), "desc": ep.get("desc", ""),
+                 "fps": fps, "presence_ratio": float((presence > 0).mean()),
+                 "extra": {**ep.get("extra", {}),
+                           **({"session_id": clip_id, "segment_index": k,
+                               "segment_frame_range": [int(s), int(e)],
+                               "segment_sec": float(args.segment_sec)} if segmented else {})},
+                 "_frame_names": fn, "_frame_offsets": fo}
+            if not np.isfinite(lowdim).all():
+                r["nonfinite_frames"] = int((~np.isfinite(lowdim).all(axis=1)).sum())
+            results.append(r)
+        if not results:
+            raise ValueError(f"no segments >= min_segment_sec ({args.min_segment_sec}s) in {T} frames")
+        return results
+    except Exception as error:
+        result["status"] = "failed"
+        result["error"] = f"{type(error).__name__}: {error}"
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            result["error"] += " :: " + error.stderr.decode("utf8", "replace")[-300:]
+        return [result]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _star(a):
+    return convert_episode(*a)
+
+
+def write_manifest(results, spec, args) -> int:
+    from lib.pipeline.clips.clip_manifest import write_clip_manifest, ClipManifestRecord
+    from lib.pipeline.datasets.descriptors import ClipDescriptor
+    expanded = []
+    for r in results:
+        if r["status"] == "ok":
+            expanded.append(r)
+        elif r["status"] == "skipped" and "clip_id" in r:
+            # resume: recover sub-clips from existing tars (plain or _segNN)
+            base = r["clip_id"]
+            tars = sorted(Path(args.frames_root).glob(f"{base}_seg*.tar")) or \
+                   [p for p in [Path(args.frames_root) / f"{base}.tar"] if p.is_file()]
+            for p in tars:
+                expanded.append({**r, "status": "ok", "clip_id": p.stem,
+                                 "_frame_names": None, "_frame_offsets": None})
+    recs = []
+    for r in expanded:
+        if "clip_id" not in r:
+            continue
+        tar_path = Path(args.frames_root) / f"{r['clip_id']}.tar"
+        fn, fo = r.get("_frame_names"), r.get("_frame_offsets")
+        if fn is None:
+            fn, fo = [], []
+            with tarfile.open(tar_path, "r") as tr:
+                for m in tr:
+                    if m.isfile() and m.name.endswith(".image.jpg"):
+                        fn.append(m.name); fo.append([int(m.offset_data), int(m.size)])
+            order = sorted(range(len(fn)), key=lambda i: fn[i])
+            fn = [fn[i] for i in order]; fo = [fo[i] for i in order]
+        extra = {"adapter": "keypoints_wds", "native_feature_source": "wds_lowdim_mano_v1",
+                 "lowdim_schema": spec.get("lowdim_schema", f"{spec['dataset']}_keypoints_world_v1"),
+                 "mano_schema": "zeros_2x55", "dataset_name": spec.get("source_id", spec["dataset"]),
+                 "keypoint_spec": spec.get("_spec_path", ""), "task": r.get("task", "")}
+        extra.update(r.get("extra", {}))
+        desc = ClipDescriptor.from_tar_shard(
+            clip_id=r["clip_id"], clip_name=r["clip_id"],
+            root_dir=str(Path(args.frames_root).resolve()),
+            seq_folder=str((Path(args.outputs_root) / r["clip_id"]).resolve()),
+            shard_path=str(tar_path.resolve()), frame_names=fn, frame_offsets=fo,
+            extra=extra)
+        recs.append(ClipManifestRecord(clip_id=r["clip_id"], source_id=spec.get("source_id", spec["dataset"]),
+                                       split=spec.get("split", args.split), descriptor=desc,
+                                       group_id=r.get("task", "")))
+    write_clip_manifest(recs, args.manifest_out)
+    return len(recs)
+
+
+def load_spec(path: str) -> dict:
+    import yaml
+    spec = yaml.safe_load(Path(path).read_text())
+    spec["_spec_path"] = str(Path(path).resolve())
+    assert spec["extractor"] in EXTRACTORS, f"unknown extractor {spec['extractor']}"
+    return spec
+
+
+def build_parser():
+    p = argparse.ArgumentParser(description="provided-keypoints -> native-feature WDS clips")
+    p.add_argument("--spec", required=True, help="YAML spec (configs/keypoint_specs/<ds>.yaml)")
+    p.add_argument("--frames_root", required=True, help="output dir for per-episode WDS tars")
+    p.add_argument("--outputs_root", required=True, help="seq_folder root (native path needs no stage outputs)")
+    p.add_argument("--manifest_out", required=True)
+    p.add_argument("--report_out", default=None)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--jpeg_quality", type=int, default=4)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--episodes", default=None, help="comma-separated explicit episode refs (overrides listing)")
+    p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--split", default="train")
+    p.add_argument("--segment_sec", type=float, default=0.0,
+                   help=">0: split each session into consecutive N-second sub-clips (_segNN tars)")
+    p.add_argument("--min_segment_sec", type=float, default=2.0,
+                   help="drop trailing segments shorter than this (only with --segment_sec)")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    spec = load_spec(args.spec)
+    for d in (args.frames_root, args.outputs_root):
+        Path(d).mkdir(parents=True, exist_ok=True)
+    extractor = EXTRACTORS[spec["extractor"]](**spec.get("extractor_args", {}))
+    if args.episodes:
+        episodes = [e.strip() for e in args.episodes.split(",") if e.strip()]
+    else:
+        episodes = extractor.list_episodes(limit=args.limit)
+    if args.limit:
+        episodes = episodes[: args.limit]
+    print(f"[{spec['dataset']}] episodes to convert: {len(episodes)}", flush=True)
+
+    started = time.perf_counter()
+    jobs = [(e, spec, args) for e in episodes]
+
+    def _log(i, batch):
+        head = batch[0]
+        print(f"[{i+1}/{len(jobs)}] {head.get('clip_id', head['episode'])} {head['status']}"
+              + (f" x{len(batch)} segs" if len(batch) > 1 else "")
+              + (f" :: {head['error']}" if head["status"] == "failed" else ""), flush=True)
+
+    results = []
+    if args.workers <= 1:
+        for i, j in enumerate(jobs):
+            batch = convert_episode(*j)
+            results.extend(batch); _log(i, batch)
+    else:
+        with get_context("spawn").Pool(args.workers) as pool:
+            for i, batch in enumerate(pool.imap_unordered(_star, jobs, chunksize=1)):
+                results.extend(batch); _log(i, batch)
+    n = write_manifest(results, spec, args)
+    failed = [r for r in results if r["status"] == "failed"]
+    report = {"dataset": spec["dataset"], "spec": spec["_spec_path"], "episodes": len(jobs),
+              "segment_sec": float(args.segment_sec or 0),
+              "converted_ok": sum(1 for r in results if r["status"] == "ok"),
+              "skipped": sum(1 for r in results if r["status"] == "skipped"),
+              "failed": len(failed), "manifest_records": n,
+              "fps": spec.get("fps"),
+              "results": [{k: v for k, v in r.items() if not k.startswith("_")} for r in results],
+              "elapsed_sec": time.perf_counter() - started}
+    if args.report_out:
+        Path(args.report_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.report_out).write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    print(json.dumps({k: v for k, v in report.items() if k != "results"}, indent=2))
+    print("KEYPOINTS_CONVERT_DONE" if not failed else "KEYPOINTS_CONVERT_DONE_WITH_FAILURES", flush=True)
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

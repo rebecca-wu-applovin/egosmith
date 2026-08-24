@@ -1,0 +1,29 @@
+# AssemblyHands — multi-view-triangulated 3D hand keypoints (Tier 1 quality anchor).
+# GCS holds ANNOTATIONS ONLY (AssemblyHands/annotations/{train,val,...}); the rectified ego
+# images (ego_images_rectified/...) were never mirrored. Pixels live in
+# Assembly101/recordings/<seq_name>/<HMC_camera>_mono10bit.mp4 (60 fps; annotation frame_idx
+# indexes those frames) — joined here via assembly101_video_prefix. Caveat: the raw HMC videos
+# are UNRECTIFIED while ego_calib intrinsics/extrinsics describe the rectified images, so the
+# packed pixels are geometrically approximate; kinematic + projection gates on the annotation
+# side are unaffected.
+# Format: joint_3d world_coord (42,3) in MILLIMETERS (unit_scale 0.001), right hand rows 0..20
+# (tips 0,4,8,12,16 = thumb..pinky tip, wrist 20), left rows 21..41 (tips 21,25,29,33,37,
+# wrist 41); per-joint joint_valid. ego_calib: per-seq per-camera K (3x3) + per-frame w2c (3,4)
+# with mm translation. No wrist rotation is provided -> derived orthonormal frame from
+# wrist/middle-MCP/index-MCP keypoints (rot6d structurally valid; not MANO-comparable).
+# Clips = one per (seq_name, ego camera). Annotated rate = 30 Hz (frame_idx step 2 @ 60 fps).
+dataset: assemblyhands
+source_id: assemblyhands
+split: val
+fps: 30            # effective annotated rate; pass --source_fps 30
+lowdim_schema: assemblyhands_triangulated_world_v1
+extractor: assemblyhands_coco
+presence_requires_projection: true  # presence bit = tracked AND projects into this camera (1.3x margin)
+extractor_args:
+  gcs_prefix: gs://foundational-research/hoi-dataset/AssemblyHands
+  split: val
+  version: v1-1
+  assembly101_video_prefix: gs://foundational-research/hoi-dataset/Assembly101/recordings
+  min_valid_tips: 3
+  unit_scale: 0.001
+  max_frames_per_clip: 600   # smoke cap; lift for the full build
