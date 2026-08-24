@@ -691,6 +691,7 @@ def iter_dexwild(data_root: str, limit: Optional[int]) -> Iterator[EpisodePayloa
         g = h5[key]
         streams = []
         video_counts = {}
+        ts_norm: dict[str, dict] = {}
         n_frames = None
         ts_ds = g.get("timesteps/timesteps")
         if ts_ds is not None:
@@ -720,6 +721,19 @@ def iter_dexwild(data_root: str, limit: Optional[int]) -> Iterator[EpisodePayloa
                 continue
             t = arr[:, 0] / 1e9 if arr[:, 0].max() > 1e15 else None  # col 0 = ns timestamps
             q = arr[:, 1:] if t is not None else arr
+            if t is not None and len(t) > 1 and bool((np.diff(t) <= 0).any()):
+                # Transport-reordered samples: DexWild HDF5 rows are ROS messages and a
+                # few arrive out of order (single-sample 4-65ms reversals with tiny |dq|,
+                # verified on toy_data 2026-08-24 -- NOT motion glitches). Stable-sort by
+                # timestamp and drop exact-duplicate stamps so the timestamps/velocity
+                # gates measure the motion, not message transport. Counts recorded in
+                # meta[timestamp_normalization] for provenance.
+                order = np.argsort(t, kind="stable")
+                reordered = int((order != np.arange(len(order))).sum())
+                t, q = t[order], q[order]
+                keep = np.concatenate([[True], np.diff(t) > 0])
+                ts_norm[sub] = {"reordered_rows": reordered, "duplicate_rows_dropped": int((~keep).sum())}
+                t, q = t[keep], q[keep]
             kind = "measured" if "leapv2" in sub else "aux"
             streams.append(JointStream(sub, q, t=t, kind=kind))
         # put leapv2 streams first so min_length/stall use the hand joints
@@ -732,7 +746,7 @@ def iter_dexwild(data_root: str, limit: Optional[int]) -> Iterator[EpisodePayloa
             fps_nominal=None,  # dt comes from per-sample ns timestamps in the data
             video_frame_counts=video_counts,
             video_expected_frames=float(n_frames) if n_frames else (float(streams[0].n) if streams else None),
-            meta={"n_timesteps": n_frames},
+            meta={"n_timesteps": n_frames, **({"timestamp_normalization": ts_norm} if ts_norm else {})},
             native={"format": "dexwild_hdf5_split_tar", "source": native_src, "hdf5_group": key},
             seq_folder=f"{native_src}#{key}",
             root_dir=str(data_root),
