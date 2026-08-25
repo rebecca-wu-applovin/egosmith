@@ -92,7 +92,7 @@ def main() -> None:
 
     # annotation coverage
     ann = 0
-    for p in fs.glob(f"{filt_base}/filter_run/annotations_v4/_shards/*.jsonl"):
+    for p in fs.glob(f"{filt_base}/filter_run/annotations_v4/_shards/*.annotations.jsonl"):
         ann += sum(1 for l in fs.cat(p).decode().splitlines() if l.strip())
 
     funnel = {
