@@ -143,8 +143,13 @@ def render_recon_overlay(tar_path, seq_folder, out_mp4, fps=15.0):
         if status == "overlay":
             T = L.shape[0]
             ji = min(int(round(i * T / max(1, T_img))), T - 1)
-            n = draw_skel(im, project(L[ji], extr[ji], intr * scale), L_C)
-            n += draw_skel(im, project(R[ji], extr[ji], intr * scale), R_C)
+            n = 0
+            for J, col in ((L[ji], L_C), (R[ji], R_C)):
+                # skip absent hands (single-hand GT fills the off-hand with dummy
+                # params -> degenerate joint cluster far smaller than a real hand)
+                if float(np.ptp(J, axis=0).max()) < 0.02:
+                    continue
+                n += draw_skel(im, project(J, extr[ji], intr * scale), col)
             inframe += n > 0
         wr.send(np.ascontiguousarray(im))
     wr.close()

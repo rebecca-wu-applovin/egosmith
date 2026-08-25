@@ -48,6 +48,16 @@ VIEWER = f"{BUCKET}/egosmith_filtered/viewer"
 fs = gcsfs.GCSFileSystem()
 
 # ---------------------------------------------------------------- adapters
+def _ego_adapter(ds, **kw):
+    """Standard egocentric layout (egocentric10k-style): sharded filter + v4
+    annotations + frames tars + HaWoR recon outputs."""
+    return dict(kind="ego", fps=15.0,
+                filt=f"{BUCKET}/egosmith_filtered/{ds}/filter_run/_shards",
+                ann=f"{BUCKET}/egosmith_filtered/{ds}/filter_run/annotations_v4/_shards",
+                frames=f"{BUCKET}/egosmith_filtered/{ds}/frames",
+                recon=f"{BUCKET}/egosmith_recon/{ds}/recon/outputs", **kw)
+
+
 ADAPTERS = {
     "egocentric100k": dict(kind="ego", fps=15.0,
                            filt=f"{BUCKET}/egosmith_filtered/egocentric100k/filter_run/_shards",
@@ -60,6 +70,18 @@ ADAPTERS = {
                           ann=f"{BUCKET}/egosmith_filtered/egocentric10k/filter_run/annotations_v4/_shards",
                           frames=f"{BUCKET}/egosmith_filtered/egocentric10k/frames",
                           recon=f"{BUCKET}/egosmith_recon/egocentric10k/recon/outputs"),
+    # Cat-1, fully processed (recon + presence-gated Layer-4 + v4 annotations);
+    # exact egocentric10k layout
+    "hd_epic": _ego_adapter("hd_epic"),
+    "assembly101": _ego_adapter("assembly101"),
+    "epic_kitchens_100": _ego_adapter("epic_kitchens_100"),
+    "holoassist": _ego_adapter("holoassist"),
+    "ego4d": _ego_adapter("ego4d"),
+    "egoverse_aria": _ego_adapter("egoverse_aria"),
+    # HaMeR-seeded recon (gloved hands); sharded ego layout + funnel stats
+    "egotouch": _ego_adapter(
+        "egotouch",
+        funnel=f"{BUCKET}/egosmith_filtered/egotouch/filter_run/funnel.json"),
     # Cat-3, recon colocated under egosmith_filtered/<ds>/outputs/
     # fps=30: descriptor.fps is null for these; annotations use frames/30 (native rate)
     "dexycb": dict(kind="cat3", fps=30.0,
@@ -74,22 +96,32 @@ ADAPTERS = {
     "taco": dict(kind="cat3", outputs=f"{BUCKET}/egosmith_recon/taco/use_gt/outputs"),
     "oakink_actions": dict(kind="cat3",
                            outputs=f"{BUCKET}/egosmith_recon/oakink_actions/use_gt/outputs"),
+    # Cat-3, GT-mode recon under egosmith_recon/<ds>/use_gt/outputs/
+    "arctic": dict(kind="cat3", fps=30.0,
+                   outputs=f"{BUCKET}/egosmith_recon/arctic/use_gt/outputs"),
+    # Cat-2 glove GT -> MANO fit; recon colocated under egosmith_filtered/dexcap/outputs/
+    "dexcap": dict(kind="cat3", fps=30.0,
+                   outputs=f"{BUCKET}/egosmith_filtered/dexcap/outputs"),
     # hot3d ships pre-rendered viz/*.overlay.mp4 — copy, don't re-render
     "hot3d": dict(kind="hot3d_viz"),
     # native lowdim (Vision Pro GT) — overlay straight from .lowdim.npy
     "egodex": dict(kind="native", fps=30.0),
+    # native lowdim (triangulated GT keypoints baked into frames tars)
+    "assemblyhands": dict(kind="native", fps=30.0),
 }
 CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric (recon)",
             "dexycb": "Cat-3 GT", "ho3d_v3": "Cat-3 GT", "show3d": "Cat-3 GT",
             "hoi4d": "Cat-3 GT", "taco": "Cat-3 GT", "oakink_actions": "Cat-3 GT",
-            "hot3d": "Cat-3 GT", "egodex": "Cat-2 native GT",
+            "hot3d": "Cat-3 GT", "arctic": "Cat-3 GT", "egodex": "Cat-2 native GT",
+            "assemblyhands": "Cat-2 native GT", "dexcap": "Cat-2 GT (glove→MANO)",
             # Cat-4 robot datasets (video-only cards, external adapter)
             "trex": "Cat-4 robot", "dexora": "Cat-4 robot", "dexwild": "Cat-4 robot",
             "hrdexdb_allegro": "Cat-4 robot", "realdex": "Cat-4 robot",
-            # Cat-1 Stage-1-only previews (video-only cards, external adapter)
-            "assembly101": "Cat-1 Stage-1 preview", "hd_epic": "Cat-1 Stage-1 preview",
-            "holoassist": "Cat-1 Stage-1 preview", "ego4d": "Cat-1 Stage-1 preview",
-            "epic_kitchens_100": "Cat-1 Stage-1 preview"}
+            # Cat-1, fully processed (recon overlays + v4 annotations)
+            "assembly101": "Cat-1 (recon)", "hd_epic": "Cat-1 (recon)",
+            "holoassist": "Cat-1 (recon)", "ego4d": "Cat-1 (recon)",
+            "epic_kitchens_100": "Cat-1 (recon)", "egoverse_aria": "Cat-1 (recon)",
+            "egotouch": "Cat-1 (seeded recon, gloved hands)"}
 
 
 def _read_jsonl_gcs(path):
@@ -536,8 +568,10 @@ def dataset_stats(ds, ad, cards):
     try:
         if ad and ad.get("funnel") and fs.exists(ad["funnel"]):
             fn = json.loads(fs.open(ad["funnel"], "rb").read())
-            stats += [("kept clips", f"{fn['final_kept_clips']:,}"),
-                      ("kept hours", f"{fn['final_hours']:,}")]
+            hours = fn.get("final_hours", fn.get("final_kept_hours"))
+            stats.append(("kept clips", f"{fn['final_kept_clips']:,}"))
+            if hours is not None:
+                stats.append(("kept hours", f"{hours:,}"))
         elif ad and ad["kind"] in ("cat3", "native", "hot3d_viz"):
             rep = f"{BUCKET}/egosmith_filtered/{ds}/filter_run/filter_report.json"
             if fs.exists(rep):
