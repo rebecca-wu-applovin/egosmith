@@ -99,24 +99,93 @@ def _hdr_num(b: bytes) -> int:
     return int(s, 8) if s else 0
 
 
+_NAME_RE = re.compile(rb"worldcode_.*\.tar\.gz")
+
+
+def _valid_hdr(hdr: bytes) -> bool:
+    if hdr[257:262] != b"ustar":
+        return False
+    try:
+        _hdr_num(hdr[124:136])
+    except ValueError:
+        return False
+    name = hdr[0:100].split(b"\0", 1)[0]
+    return bool(_NAME_RE.search(name)) or name.startswith(b"WIYH-")
+
+
+def _resync(cf: "ConcatRanged", pos: int, limit: int = 4 * 10**9) -> int | None:
+    """Scan forward from pos (512-aligned windows) for the next valid member
+    header. Bounded: gives up after `limit` bytes. Some scenes carry re-split /
+    overlapping parts (Apartment/Office/Supermarket) that corrupt the chain at
+    part junctions — this skips the damaged span and logs it."""
+    win = 16 * 1024 * 1024
+    scanned = 0
+    while scanned < limit and pos + BLK <= cf.total:
+        chunk = cf.read(pos, min(win, cf.total - pos))
+        for off in range(0, len(chunk) - BLK + 1, BLK):
+            hdr = chunk[off:off + BLK]
+            if hdr != b"\0" * BLK and _valid_hdr(hdr):
+                return pos + off
+        pos += len(chunk)
+        scanned += len(chunk)
+    return None
+
+
 def walk_scene(fs, prefix: str, scene: str, out_dir: Path) -> dict:
     parts = list_parts(prefix, scene)
     cf = ConcatRanged(fs, parts)
     (out_dir / f"{scene}.parts.json").write_text(json.dumps(parts, indent=1))
     members, pos, zeros, n_hdr = [], 0, 0, 0
+    resyncs, skipped_bytes = 0, 0
     t0 = time.time()
     pending_longname = None
+
+    def try_resync(from_pos, why):
+        nonlocal resyncs, skipped_bytes, zeros, pending_longname
+        nxt = _resync(cf, from_pos)
+        if nxt is None:
+            return None
+        resyncs += 1
+        skipped_bytes += nxt - from_pos
+        zeros = 0
+        pending_longname = None
+        print(f"  [{scene}] RESYNC #{resyncs} ({why}) at {from_pos/1e12:.3f}TB -> "
+              f"+{(nxt-from_pos)/1e9:.2f}GB skipped", flush=True)
+        return nxt
+
     while pos + BLK <= cf.total:
         hdr = cf.read(pos, BLK)
         n_hdr += 1
         if hdr == b"\0" * BLK:
             zeros += 1
             if zeros >= 2:
+                # end-of-archive marker; if plenty of bytes remain, another
+                # span may follow the damaged/padded region
+                if cf.total - pos > 10**9:
+                    nxt = try_resync(pos + BLK, "zeros-mid-stream")
+                    if nxt is not None:
+                        pos = nxt
+                        continue
                 break
             pos += BLK
             continue
         zeros = 0
-        size = _hdr_num(hdr[124:136])
+        if not _valid_hdr(hdr) and hdr[257:262] != b"ustar":
+            nxt = try_resync(pos, "bad-header")
+            if nxt is None:
+                print(f"  [{scene}] chain lost at {pos/1e12:.3f}TB, no resync in 4GB — stop",
+                      flush=True)
+                break
+            pos = nxt
+            continue
+        try:
+            size = _hdr_num(hdr[124:136])
+        except ValueError:
+            nxt = try_resync(pos, "bad-size-field")
+            if nxt is None:
+                break
+            pos = nxt
+            continue
         typ = hdr[156:157]
         name = _hdr_str(hdr[0:100])
         prefix_f = _hdr_str(hdr[345:500]) if hdr[257:262] == b"ustar" else ""
@@ -144,6 +213,7 @@ def walk_scene(fs, prefix: str, scene: str, out_dir: Path) -> dict:
     rep = {"scene": scene, "parts": len(parts), "total_bytes": cf.total,
            "members": len(members), "member_bytes": span,
            "coverage": round(span / cf.total, 4), "header_reads": n_hdr,
+           "resyncs": resyncs, "skipped_bytes": skipped_bytes,
            "wall_sec": round(time.time() - t0, 1)}
     print(f"[{scene}] DONE {rep}", flush=True)
     return rep
