@@ -29,6 +29,12 @@ Usage (smoke, local sample archives):
 Usage (fleet, stream a part object):
   python scripts/build/generate_wiyh_recon_wds.py \
       --part gs://.../WIYH/Candlelight/Candlelight.tar.gz.~000 --max_samples 0 ...
+
+Usage (fleet, member-offset index from index_wiyh_tar.py — byte-split parts ~001+
+start mid-member, so full-scene runs MUST use this mode; ranged fetches may span
+part boundaries):
+  python scripts/build/generate_wiyh_recon_wds.py \
+      --members_jsonl shard.members.jsonl --parts_json Scene.parts.json ...
 """
 from __future__ import annotations
 
@@ -62,6 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--part", default="", help="gs:// outer part tar to stream")
     src.add_argument("--sample_tars", nargs="+", default=None, help="local worldcode_*.tar.gz files")
+    src.add_argument("--members_jsonl", default="",
+                     help="member-offset rows {scene,name,offset,size} from index_wiyh_tar.py; "
+                          "requires --parts_json unless rows carry parts_json paths per scene")
+    p.add_argument("--parts_json", default="",
+                   help="ordered [{uri,size}] part list for --members_jsonl (single-scene shards)")
     p.add_argument("--frames_root", required=True)
     p.add_argument("--outputs_root", required=True)
     p.add_argument("--manifest_out", required=True)
@@ -199,12 +210,48 @@ def convert_sample(sample_root: Path, sample_name: str, args, records: list, sta
         stats["kept_sec_out"] += len(names) / eff_fps
 
 
+def _ranged_concat_read(fs, parts: list[dict], offset: int, size: int) -> bytes:
+    """Read [offset, offset+size) from the logical concatenation of the parts
+    (byte-split archives: a member may span a part boundary)."""
+    out, pos, end = [], 0, offset + size
+    for p in parts:
+        p_lo, p_hi = pos, pos + p["size"]
+        pos = p_hi
+        if p_hi <= offset:
+            continue
+        if p_lo >= end:
+            break
+        lo = max(offset, p_lo) - p_lo
+        hi = min(end, p_hi) - p_lo
+        out.append(fs.cat_file(p["uri"].replace("gs://", ""), start=lo, end=hi))
+    data = b"".join(out)
+    if len(data) != size:
+        raise IOError(f"ranged concat read: got {len(data)} != {size}")
+    return data
+
+
 def _iter_sample_tars(args):
     """Yield (sample_name, local_gz_path, gz_bytes, cleanup_fn)."""
     if args.sample_tars:
         for p in args.sample_tars:
             p = Path(p)
             yield p.name.replace(".tar.gz", ""), p, p.stat().st_size, lambda: None
+        return
+    if args.members_jsonl:
+        import gcsfs
+        fs = gcsfs.GCSFileSystem()
+        parts = json.loads(Path(args.parts_json).read_text())
+        work = Path(args.work_dir)
+        work.mkdir(parents=True, exist_ok=True)
+        members = [json.loads(l) for l in open(args.members_jsonl) if l.strip()]
+        for i, m in enumerate(members):
+            if args.max_samples and i >= args.max_samples:
+                return
+            name = Path(m["name"]).name.replace(".tar.gz", "")
+            local = work / f"{name}.tar.gz"
+            with open(local, "wb") as w:
+                w.write(_ranged_concat_read(fs, parts, int(m["offset"]), int(m["size"])))
+            yield name, local, int(m["size"]), (lambda l=local: l.unlink(missing_ok=True))
         return
     import gcsfs
     fs = gcsfs.GCSFileSystem()

@@ -41,6 +41,16 @@ GCS_FILT = os.environ.get(
 WORK = Path(os.environ.get("PHASED_WORK", "/root/egosmith_annotations/_phased_work"))
 NPZ_KEYS = ["traj", "tstamp", "img_focal", "img_center", "scale"]
 
+# Gate config (env-overridable). Defaults = the shipped 15fps regime (2x the
+# 30fps-tuned per-frame steps). For other source fps, scale steps by 30/fps
+# (e.g. WIYH 10fps native: SOURCE_FPS=10, steps 3x -> 2.97/0.9/0.9/0.6/2.1).
+SOURCE_FPS = os.environ.get("PHASED_SOURCE_FPS", "15")
+GATE_WRIST = os.environ.get("PHASED_MAX_WRIST_ROT_STEP", "1.98")
+GATE_HAND = os.environ.get("PHASED_MAX_HAND_TRANS_STEP", "0.6")
+GATE_FINGER = os.environ.get("PHASED_MAX_FINGER_TRANS_STEP", "0.6")
+GATE_CAM_T = os.environ.get("PHASED_MAX_CAM_TRANS_STEP", "0.4")
+GATE_CAM_R = os.environ.get("PHASED_MAX_CAM_ROT_STEP", "1.4")
+
 fs = gcsfs.GCSFileSystem()
 
 
@@ -109,7 +119,7 @@ def materialize_clip(shard_sfx, clip_id, rec, base_dir):
     d["seq_folder"] = str(seq)
     cx, cy = small["img_center"].tolist()
     d["width"] = int(round(cx * 2)); d["height"] = int(round(cy * 2))
-    d["fps"] = float(d.get("extra", {}).get("recon_fps") or 15.0)
+    d["fps"] = float(d.get("extra", {}).get("recon_fps") or float(SOURCE_FPS))
     return rec
 
 
@@ -171,18 +181,18 @@ def process_shard(sfx: str, workers: int):
         [sys.executable, f"{EGOSMITH_ROOT}/scripts/build/filter_manifest_by_quality.py",
          "--input_manifest", str(in_man), "--output_manifest", str(out_man),
          "--report_out", str(rep), "--stages", "infiller", "--workers", "16",
-         "--source_fps", "15", "--target_fps", "30",
+         "--source_fps", SOURCE_FPS, "--target_fps", "30",
          # step gates encode (max velocity x frame interval); tuned on 30fps data,
-         # our frames are 15fps -> 2x the per-frame step for the same physical limit
+         # scaled by 30/source_fps for the same physical limit (defaults = 15fps).
          # W7 pilot finding: clips with zero valid poses pass all motion gates
          # trivially (1.2% leak measured on shipped 100K keeps) — require poses
          # present in at least half the frames.
          "--min_presence_ratio", "0.5",
-         "--max_wrist_rotation_step", "1.98",
-         "--max_hand_translation_step", "0.6",
-         "--max_finger_translation_step", "0.6",
-         "--max_camera_translation_step", "0.4",
-         "--max_camera_rotation_step", "1.4"],
+         "--max_wrist_rotation_step", GATE_WRIST,
+         "--max_hand_translation_step", GATE_HAND,
+         "--max_finger_translation_step", GATE_FINGER,
+         "--max_camera_translation_step", GATE_CAM_T,
+         "--max_camera_rotation_step", GATE_CAM_R],
         capture_output=True, text=True, env={**os.environ, "PYTHONPATH": f"{EGOSMITH_ROOT}/src"})
     if r.returncode != 0 or not out_man.exists():
         raise RuntimeError(f"filter failed: {r.stderr[-300:]}")
