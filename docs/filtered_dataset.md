@@ -37,6 +37,13 @@ egosmith_filtered/
 | hot3d | 357 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | oakink_actions | 2,488 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | egodex | 158,564 | native — GT read straight from the tar | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` |
+| h2o | 149 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
+
+H2O (ETH, ICCV 2021; egocentric cam4 only, 30 fps, two-hands+object tabletop manipulation;
+built by `scripts/build/generate_h2o_world_res.py`, W9 2026-08-25): 184 sequences converted
+(1.06 h) → 149 kept (0.85 h) under the canonical GT filter (`--stages infiller --source_fps 30
+--target_fps 30 --min_presence_ratio 0.5`); drops are motion-step glitches. License: academic
+use only (see `hoi-dataset/H2O/PROVENANCE.md`).
 
 All GT here is **ground truth, not pixel-estimated**. For taco/hot3d/oakink the datasets ship GT
 MANO + GT camera, which the converter packages into the pipeline's canonical world-space

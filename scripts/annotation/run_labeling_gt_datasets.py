@@ -43,6 +43,7 @@ DATASETS = {
     # fmax 16: single short atomic actions (~8s); 16 frames @3fps covers them while keeping
     # the 12.7K-clip pass inside the labeling budget (px/detail/model/prompt unchanged).
     "gigahands":      {"local": "/w6/gigahands/full/frames", "fmax": 16},
+    "h2o":            {"local": "/root/w9/h2o/frames"},
 }
 OUT_DIR = "/root/egosmith_annotations"
 PX, DETAIL, TARGET_FPS, FMIN, FMAX = 1024, "high", 3.0, 12, 40

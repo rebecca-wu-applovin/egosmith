@@ -104,6 +104,9 @@ ADAPTERS = {
     # Cat-2 glove GT -> MANO fit; recon colocated under egosmith_filtered/dexcap/outputs/
     "dexcap": dict(kind="cat3", fps=30.0,
                    outputs=f"{BUCKET}/egosmith_filtered/dexcap/outputs"),
+    # W9: H2O egocentric cam4, GT MANO+camera (use_gt)
+    "h2o": dict(kind="cat3", fps=30.0,
+                outputs=f"{BUCKET}/egosmith_recon/h2o/use_gt/outputs"),
     # hot3d ships pre-rendered viz/*.overlay.mp4 — copy, don't re-render
     "hot3d": dict(kind="hot3d_viz"),
     # native lowdim (Vision Pro GT) — overlay straight from .lowdim.npy
@@ -114,7 +117,8 @@ ADAPTERS = {
 CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric (recon)",
             "dexycb": "Cat-3 GT", "ho3d_v3": "Cat-3 GT", "show3d": "Cat-3 GT",
             "hoi4d": "Cat-3 GT", "taco": "Cat-3 GT", "oakink_actions": "Cat-3 GT",
-            "hot3d": "Cat-3 GT", "arctic": "Cat-3 GT", "egodex": "Cat-2 native GT",
+            "hot3d": "Cat-3 GT", "arctic": "Cat-3 GT", "h2o": "Cat-3 GT",
+            "egodex": "Cat-2 native GT",
             "assemblyhands": "Cat-2 native GT", "dexcap": "Cat-2 GT (glove→MANO)",
             # Cat-4 robot datasets (video-only cards, external adapter)
             "trex": "Cat-4 robot", "dexora": "Cat-4 robot", "dexwild": "Cat-4 robot",
@@ -456,24 +460,30 @@ AUTH_BASE = f"https://storage.cloud.google.com/{VIEWER}"
 EMBED_MAX_BYTES = 900_000   # embed as-is under this; re-encode smaller above it
 
 
+EMBED_CAP_SEC = 8
+
+
 def _embed_uri(mp4_path):
-    """data:video/mp4 URI, re-encoding big clips down (8s cap, 288p, crf 33)."""
+    """(data:video/mp4 URI, truncated: bool) — big clips re-encode to an 8s/288p preview."""
     import base64
     import tempfile
     p = Path(mp4_path)
     data = p.read_bytes()
+    truncated = False
     if len(data) > EMBED_MAX_BYTES:
         import imageio_ffmpeg
         ff = imageio_ffmpeg.get_ffmpeg_exe()
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as t:
             tmp = t.name
-        subprocess.run([ff, "-y", "-loglevel", "error", "-t", "8", "-i", str(p),
+        subprocess.run([ff, "-y", "-loglevel", "error", "-t", str(EMBED_CAP_SEC),
+                        "-i", str(p),
                         "-vf", "scale=-2:'min(288,ih)'", "-c:v", "libx264",
                         "-pix_fmt", "yuv420p", "-crf", "33", "-movflags", "+faststart",
                         "-an", tmp], check=True, capture_output=True)
         data = Path(tmp).read_bytes()
         os.unlink(tmp)
-    return "data:video/mp4;base64," + base64.b64encode(data).decode()
+        truncated = True
+    return "data:video/mp4;base64," + base64.b64encode(data).decode(), truncated
 
 
 def _card_html(c):
@@ -520,6 +530,11 @@ def _card_html(c):
                  + "</div>")
     src = c.get("video_uri") or c["video"]
     raw = f' &middot; <a href="{esc(c["raw_url"])}">full quality &nearr;</a>' if c.get("raw_url") else ""
+    if c.get("embed_truncated"):
+        dur = (c.get("meta") or {}).get("dur_s")
+        raw = (f' &middot; <span class="badge b-bad">preview: first {EMBED_CAP_SEC}s'
+               + (f" of {dur:g}s" if dur else "") + "</span>"
+               + f' &middot; <a href="{esc(c["raw_url"])}">full video &nearr;</a>')
     return (f'<figure class="card"><video controls loop muted playsinline preload="metadata" '
             f'src="{src}"></video><div class="body">'
             f'<div class="cid">{esc(c["clip_id"])}{badge}</div>'
@@ -591,7 +606,7 @@ def publish(ds, work, upload_clips=True):
     for c in cards:
         mp4 = wdir / c["video"]
         if mp4.exists():
-            c["video_uri"] = _embed_uri(mp4)
+            c["video_uri"], c["embed_truncated"] = _embed_uri(mp4)
             c["raw_url"] = f"{AUTH_BASE}/{ds}/{c['video']}"
     stats = dataset_stats(ds, ADAPTERS.get(ds), cards)
     page = wdir / "index.html"
