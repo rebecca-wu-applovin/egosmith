@@ -174,6 +174,10 @@ def process_shard(sfx: str, workers: int):
          "--source_fps", "15", "--target_fps", "30",
          # step gates encode (max velocity x frame interval); tuned on 30fps data,
          # our frames are 15fps -> 2x the per-frame step for the same physical limit
+         # W7 pilot finding: clips with zero valid poses pass all motion gates
+         # trivially (1.2% leak measured on shipped 100K keeps) — require poses
+         # present in at least half the frames.
+         "--min_presence_ratio", "0.5",
          "--max_wrist_rotation_step", "1.98",
          "--max_hand_translation_step", "0.6",
          "--max_finger_translation_step", "0.6",
