@@ -16,9 +16,18 @@ Per sequence this writes the standard artifacts (`--stages infiller`):
 - ``outputs_root/<clip_id>/SLAM/hawor_slam_w_scale_0.npz`` — c2w traj + pinhole K.
 - ``tracks_0_<T>`` + ``.stage_done_infiller`` marker.
 
-Conventions (verified against the ARCTIC repo):
-- MANO: full 45-d axis-angle articulation (`pose`), global orient `rot`, `trans`, `shape`.
-  ARCTIC kp2d/kp3d live in **undistorted** image space (`arctic_dataset.py`), so we
+Conventions (verified against the ARCTIC repo + numeric parity with ARCTIC's own smplx MANO):
+- MANO: ARCTIC builds its layers with ``flat_hand_mean=False`` (common/body_models.py), i.e.
+  the stored 45-d `pose` is MEAN-RELATIVE. The pipeline's MANOLayer consumes pose as ABSOLUTE
+  rotations, so we ADD ``hands_mean`` (per side, from the same MANO pkls) at conversion.
+  Shipping the raw pose (pre-2026-08-25 bug) straightened the fingers by up to ~5 cm.
+- Left hand: the pipeline's left model applies the smplx MANO_LEFT shapedirs x-flip bugfix,
+  ARCTIC's reference model does not; the shape-dependent wrist/template offset (~7 mm) is
+  compensated with a constant per-clip ``trans`` correction  j0_arctic(beta) - j0_pipe(beta)
+  computed directly from the pkl (J_regressor row 0; only the x component differs).
+  After both fixes: right wrist 0.0 mm / left wrist 0.0 mm vs ARCTIC's own forward pass;
+  residual internal-joint difference (left pose-blendshape mirroring) ~2-4 mm.
+- kp2d/kp3d live in **undistorted** image space (`arctic_dataset.py`), so we
   undistort the frame with (K, dist8) keeping K, and project with K.
 - Camera: `egocam.dist.npy` gives world->cam (`R_k_cam_np`, `T_k_cam_np`); we invert to
   c2w for the SLAM sidecar (the camera reader re-inverts to w2c). Ego K used **as-is** on
@@ -48,6 +57,53 @@ from scipy.spatial.transform import Rotation
 
 EGO_VIEW = "0"
 
+MANO_PKL_DIR = "/root/arctic/unpack/body_models/mano"
+_MANO_SIDE_CACHE = {}
+
+
+def _mano_side_constants(side: str) -> dict:
+    """hands_mean + shape-space pieces for one side, straight from the MANO pkl."""
+    if side in _MANO_SIDE_CACHE:
+        return _MANO_SIDE_CACHE[side]
+    import pickle
+    with open(Path(MANO_PKL_DIR) / f"MANO_{side.upper()}.pkl", "rb") as f:
+        mdl = pickle.load(f, encoding="latin1")
+    from smplx.vertex_ids import vertex_ids
+    consts = {"hands_mean": np.asarray(mdl["hands_mean"], np.float64).reshape(45)}
+    if side == "left":
+        jreg = np.asarray(mdl["J_regressor"].todense())                    # (16,778)
+        rows = np.concatenate([jreg, np.eye(778)[list(vertex_ids["mano"].values())]])  # +5 tips
+        S = np.asarray(mdl["shapedirs"])                                    # (778,3,10)
+        Sp = S.copy()
+        Sp[:, 0, :] *= -1                                                   # pipeline bugfixed left
+        consts.update(
+            rows=rows,
+            A=np.einsum("jv,vck->jck", rows, Sp).reshape(-1, 10),           # pipeline shape system
+            B=np.einsum("jv,vck->jck", rows, S).reshape(-1, 10),            # ARCTIC shape system
+            jreg0_S=jreg[0] @ S.reshape(778, -1),                           # (3*10,) for j0 delta
+            jreg0_Sp=jreg[0] @ Sp.reshape(778, -1),
+        )
+    _MANO_SIDE_CACHE[side] = consts
+    return consts
+
+
+def _left_shape_compensation(betas: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(betas', j0_delta): params that reproduce ARCTIC's LEFT rest geometry under the
+    pipeline's left model.
+
+    ARCTIC's smplx MANO_LEFT lacks the shapedirs x-flip bugfix the pipeline's left model
+    carries, so the same betas shape the two models differently. Solve least-squares
+    betas' with  rows@Sp@betas' ~= rows@S@betas  over the 16 joints + 5 fingertips
+    (rest pose; cuts worst-subject joint error ~7.9mm -> ~2.4mm), and correct trans by
+    the root-joint delta  j0_arctic(betas) - j0_pipe(betas')  so the wrist stays exact.
+    """
+    c = _mano_side_constants("left")
+    b = c["B"] @ betas.astype(np.float64)
+    betas_p, *_ = np.linalg.lstsq(c["A"], b, rcond=None)
+    j0_delta = (c["jreg0_S"].reshape(3, 10) @ betas.astype(np.float64)
+                - c["jreg0_Sp"].reshape(3, 10) @ betas_p)
+    return betas_p.astype(np.float32), j0_delta.astype(np.float32)
+
 
 def build_parser():
     p = argparse.ArgumentParser(description="Convert ARCTIC ego sequences to filter-ready artifacts")
@@ -68,6 +124,8 @@ def build_parser():
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--include", default=None, help="substring filter on <subj>/<seq>")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--pose_only", action="store_true",
+                   help="rewrite world_space_res.pth for already-converted clips (frames/tars untouched)")
     p.add_argument("--source_id", default="arctic")
     p.add_argument("--split_label", default="train")
     return p
@@ -126,6 +184,40 @@ def convert_seq(subj, seq, args, ioi_offset):
     tar_out = frames_root / f"{clip_id}.tar"
     done_marker = seq_folder / ".stage_done_infiller"
     result = {"subj": subj, "seq": seq, "clip_id": clip_id, "status": "ok"}
+    if args.pose_only:
+        try:
+            old = joblib.load(seq_folder / "world_space_res.pth")
+            T = int(old[0].shape[1])
+            mano = np.load(root / "raw_seqs" / subj / f"{seq}.mano.npy", allow_pickle=True).item()
+            trans = np.zeros((2, T, 3), np.float32)
+            rot = np.zeros((2, T, 3), np.float32)
+            hand_pose = np.zeros((2, T, 45), np.float32)
+            betas_arr = np.zeros((2, T, 10), np.float32)
+            valid = np.zeros((2, T), np.float32)
+            for hand_index, side in ((0, "left"), (1, "right")):
+                hd = mano.get(side)
+                if hd is None:
+                    continue
+                betas = np.asarray(hd["shape"], dtype=np.float32).reshape(-1)[:10]
+                r = np.asarray(hd["rot"], dtype=np.float32)[:T]
+                p = np.asarray(hd["pose"], dtype=np.float32)[:T]
+                tr = np.asarray(hd["trans"], dtype=np.float32)[:T].copy()
+                consts = _mano_side_constants(side)
+                p = (p.astype(np.float64) + consts["hands_mean"][None]).astype(np.float32)
+                if side == "left":
+                    betas, j0_delta = _left_shape_compensation(betas)
+                    tr += j0_delta[None]
+                rot[hand_index, :T] = r
+                hand_pose[hand_index, :T] = p
+                trans[hand_index, :T] = tr
+                betas_arr[hand_index, :T] = betas
+                valid[hand_index, :T] = 1.0
+            joblib.dump([trans, rot, hand_pose, betas_arr, valid], seq_folder / "world_space_res.pth")
+            result["frames"] = T
+        except Exception as error:
+            result["status"] = "failed"
+            result["error"] = f"{type(error).__name__}: {error}"
+        return result
     if args.resume and tar_out.is_file() and done_marker.exists() and (seq_folder / "world_space_res.pth").is_file():
         return {**result, "status": "skipped"}
 
@@ -166,6 +258,12 @@ def convert_seq(subj, seq, args, ioi_offset):
             r = np.asarray(hd["rot"], dtype=np.float32)[:T]
             p = np.asarray(hd["pose"], dtype=np.float32)[:T]
             tr = np.asarray(hd["trans"], dtype=np.float32)[:T]
+            consts = _mano_side_constants(side)
+            p = (p.astype(np.float64) + consts["hands_mean"][None]).astype(np.float32)
+            tr = tr.copy()
+            if side == "left":
+                betas, j0_delta = _left_shape_compensation(betas)
+                tr += j0_delta[None]
             rot[hand_index, :T] = r
             hand_pose[hand_index, :T] = p
             trans[hand_index, :T] = tr
