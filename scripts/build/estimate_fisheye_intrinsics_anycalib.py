@@ -33,9 +33,11 @@ import torch
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--index_jsonl", required=True, help="rows with at least {uri, group}")
-    ap.add_argument("--key_mode", choices=["hmc_serial", "group_dir"], required=True,
+    ap.add_argument("--key_mode", choices=["hmc_serial", "group_dir", "take_prefix"], required=True,
                     help="hmc_serial: key 'HMC_<serial>' from basename; "
-                         "group_dir: key '/Videos/<group>/'")
+                         "group_dir: key '/Videos/<group>/'; "
+                         "take_prefix: key '/takes/<university>_' from the take-name group "
+                         "(Ego-Exo4D: per-university Aria device pools)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--vids_per_key", type=int, default=3)
     ap.add_argument("--frames_per_vid", type=int, default=5)
@@ -49,6 +51,8 @@ def main() -> None:
     for r in rows:
         if args.key_mode == "hmc_serial":
             key = "HMC_" + r["uri"].rsplit("/", 1)[-1].split("_")[1]
+        elif args.key_mode == "take_prefix":
+            key = f'/takes/{r["group"].split("_")[0]}_'
         else:
             key = f'/Videos/{r["group"]}/'
         by_key[key].append(r["uri"])
