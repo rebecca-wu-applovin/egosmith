@@ -45,6 +45,13 @@ built by `scripts/build/generate_h2o_world_res.py`, W9 2026-08-25): 184 sequence
 --target_fps 30 --min_presence_ratio 0.5`); drops are motion-step glitches. License: academic
 use only (see `hoi-dataset/H2O/PROVENANCE.md`).
 
+**DexCap caveat (audit 2026-08-25):** every kept clip carries
+`metadata.finger_articulation_unreliable=true` (`severity: severe` for `packaging_*`,
+`moderate` for `wipe_*`) — DexCap's native EMF-glove finger articulation contradicts the
+video (raw-target projection proof; converter exonerated at 5.7–7.0 mm fit). Mask
+finger-level targets in training; wrist pose, video, and language annotations are reliable.
+Evidence: `egosmith_filtered/_audits/handedness_audit_2026-08-25/`.
+
 All GT here is **ground truth, not pixel-estimated**. For taco/hot3d/oakink the datasets ship GT
 MANO + GT camera, which the converter packages into the pipeline's canonical world-space
 `world_space_res.pth` (GT re-expressed, no SLAM/HaWoR estimation). A video-only reconstruction
