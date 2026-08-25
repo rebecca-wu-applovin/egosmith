@@ -77,7 +77,9 @@ ADAPTERS = {
     "epic_kitchens_100": _ego_adapter("epic_kitchens_100"),
     "holoassist": _ego_adapter("holoassist"),
     "ego4d": _ego_adapter("ego4d"),
-    "egoverse_aria": _ego_adapter("egoverse_aria"),
+    # 96/153 shards kept 0 clips post presence gating -> few kept clips per
+    # non-empty shard; widen the shard fan-out so n=50 kept cards materialize
+    "egoverse_aria": _ego_adapter("egoverse_aria", shards_k=40),
     # HaMeR-seeded recon (gloved hands); sharded ego layout + funnel stats
     "egotouch": _ego_adapter(
         "egotouch",
@@ -161,7 +163,7 @@ def sample_ego(ds, ad, n, seed, shards_k=10):
     if not ready:
         raise RuntimeError(f"{ds}: no shards with both filter + annotations")
     picked = rng.sample(ready, min(shards_k, len(ready)))
-    per = max(1, n // len(picked))
+    per = max(1, -(-n // len(picked)))  # ceil: floor under-fills when n % shards != 0
     out = []
     for sh in picked:
         recs = _read_jsonl_gcs(f"{ad['filt']}/{sh}.filtered.jsonl")
@@ -310,7 +312,7 @@ def render_dataset(ds, n, seed, work):
 
     n_dropped = max(6, n // 5)
     if ad["kind"] == "ego":
-        samples = sample_ego(ds, ad, n, seed)
+        samples = sample_ego(ds, ad, n, seed, shards_k=ad.get("shards_k", 10))
         dropped = sample_dropped_ego(ds, ad, n_dropped, seed)
     else:
         samples = sample_cat3(ds, ad, n, seed)
