@@ -90,10 +90,20 @@ def main() -> None:
             agg["quality_reason_counts"][k] = agg["quality_reason_counts"].get(k, 0) + v
     fs.pipe(f"{filt_base}/filter_run/filter_report.json", json.dumps(agg, indent=1).encode())
 
-    # annotation coverage
-    ann = 0
-    for p in fs.glob(f"{filt_base}/filter_run/annotations_v4/_shards/*.annotations.jsonl"):
-        ann += sum(1 for l in fs.cat(p).decode().splitlines() if l.strip())
+    # annotation coverage: merge per-shard files, dedupe by clip_id (concurrent
+    # labelers can race a shard), write the merged annotations.v4.jsonl
+    seen_ann = set()
+    with fs.open(f"{filt_base}/filter_run/annotations.v4.jsonl", "w") as out:
+        for p in sorted(fs.glob(f"{filt_base}/filter_run/annotations_v4/_shards/*.annotations.jsonl")):
+            for l in fs.cat(p).decode().splitlines():
+                if not l.strip():
+                    continue
+                cid = json.loads(l).get("clip_id")
+                if cid in seen_ann:
+                    continue
+                seen_ann.add(cid)
+                out.write(l + "\n")
+    ann = len(seen_ann)
 
     funnel = {
         "dataset": ds,
