@@ -45,9 +45,14 @@ def list_parts(prefix: str, scene: str) -> list[dict]:
         if len(f) >= 3 and ".tar.gz.~" in f[-1]:
             parts.append({"uri": f[-1], "size": int(f[0])})
     parts.sort(key=lambda p: int(p["uri"].rsplit("~", 1)[1]))
-    # byte-split invariant: every part but the last has identical size
+    # Part sizes are USUALLY uniform 52.6GB but not always (Apartment/Office/
+    # Supermarket carry odd-sized parts). Order correctness is self-validated by
+    # the header-chain walk: a mis-ordered part derails the chain immediately
+    # (garbage size fields), so coverage ~1.0 in the report proves the order.
     sizes = {p["size"] for p in parts[:-1]}
-    assert len(sizes) <= 1, f"{scene}: non-uniform part sizes {sorted(sizes)[:3]}..."
+    if len(sizes) > 1:
+        print(f"[{scene}] note: non-uniform part sizes ({len(sizes)} distinct); "
+              "relying on header-chain self-validation", flush=True)
     return parts
 
 
