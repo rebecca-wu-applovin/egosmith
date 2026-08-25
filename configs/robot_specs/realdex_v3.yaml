@@ -1,0 +1,41 @@
+# RealDex spec v3 -- Shadow Dexterous Hand (rh_*) on a UR arm (ra_*), rosbag-extracted.
+# NEW FILE (v1/v2 left untouched; new-files-only rule).
+#
+# WHY v3: the re-mirror resumed after the v2 close (11 -> 24 of 53 object zips,
+# last object 2026-08-24T23:49Z), so per the v2 header's refresh rule the envelope
+# is recalibrated over ALL 52 mirrored sequences (calib snapshot:
+# /root/cat4_qc/realdex_new/calib_24zips.json), same formula as v1/v2
+# (pos [p0.1-0.15, p99.9+0.15] on |angle|, floored at 0; vel/acc p99.9 x 1.5),
+# then UNION with the v2 envelope so no previously-kept sequence can be re-dropped.
+# Gate thresholds unchanged. Refresh again by the same recipe if more zips land.
+robot: shadow_hand_ur_arm
+dataset: realdex
+spec_version: 3
+license_note: >-
+  LICENSE CONCERN: RealDex ships under academic/research-only terms (per the RealDex
+  release; no LICENSE file is present in the GCS mirror to confirm redistribution
+  rights). Episodes are processed anyway per instruction -- downstream use must
+  re-review before any commercial training.
+streams:
+  hand_angles:
+    kind: measured
+    dof: 24
+    pos_min: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.635, 0.359, 0, 0, 1.421, 0, 0]
+    pos_max: [0.484, 0.913, 1.57, 1.52, 0.509, 1.46, 1.667, 1.113, 0.516, 1.31, 1.799, 1.12, 0.92, 0.577, 1.17, 1.757, 1.03, 1.282, 1.44, 0.403, 0.48, 1.742, 0.668, 0.832]
+    max_vel: [2.04, 4.9, 8.54, 11.8, 2.12, 5.14, 8.9, 11.9, 2.08, 5.47, 8.38, 10.3, 3.14, 2.2, 3.61, 8.1, 10.4, 1.59, 2.08, 2.25, 3.43, 1, 1.32, 1.8]
+    max_acc: [66, 261.2, 321.6, 428.1, 75.8, 256.6, 337.6, 399, 80.1, 221.8, 308.3, 332.6, 43.5, 46, 98.6, 296.5, 332.7, 34.6, 33.5, 80, 158.7, 30, 54.5, 80.7]
+  arm_angles:
+    kind: measured
+    dof: 6
+    pos_min: [0, 1.48, 0, 0, 1.41, 1.71]
+    pos_max: [0.891, 2.21, 2.212, 1.389, 2.686, 3.31]
+    max_vel: [1, 1, 1.13, 1.47, 1, 2.04]
+    max_acc: [15, 15, 15, 15, 15, 34.8]
+gates:
+  pos_limit: {max_violation_frac: 0.005}
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 10}
+  health: {min_len_s: 2.0, max_stall_s: 15.0, stall_eps_rad_s: 0.003, max_nan_frac: 0.0, max_const_channel_frac: 0.7}
+  dedup: {downsample_hz: 5, quant: 0.01}
