@@ -121,11 +121,20 @@ def render_recon_overlay(tar_path, seq_folder, out_mp4, fps=15.0):
     if not frames:
         raise RuntimeError(f"no frames in {tar_path}")
     status, note, L = "overlay", None, None
+    absent = {"L": False, "R": False}
     try:
         L, R = compute_world_joints(Path(seq_folder), _device())
+        L, R = np.asarray(L), np.asarray(R)
         extr, intr = load_camera(Path(seq_folder), L.shape[0])
         extr = np.asarray(extr)
         intr = np.asarray(intr).reshape(-1)[:4]
+        for key, Jseq in (("L", L), ("R", R)):
+            # absent hand in single-hand GT = dummy MANO params -> either a frozen
+            # identity-pose hand (zero motion across the whole clip) or a degenerate
+            # per-frame joint cluster far smaller than a real hand
+            static = float(np.ptp(Jseq, axis=0).max()) < 1e-4 if Jseq.shape[0] > 1 else False
+            tiny = float(np.median(np.ptp(Jseq, axis=1).max(axis=1))) < 0.02
+            absent[key] = static or tiny
     except Exception as e:  # noqa: BLE001
         status = "rgb_only"
         try:
@@ -144,10 +153,11 @@ def render_recon_overlay(tar_path, seq_folder, out_mp4, fps=15.0):
             T = L.shape[0]
             ji = min(int(round(i * T / max(1, T_img))), T - 1)
             n = 0
-            for J, col in ((L[ji], L_C), (R[ji], R_C)):
-                # skip absent hands (single-hand GT fills the off-hand with dummy
-                # params -> degenerate joint cluster far smaller than a real hand)
-                if float(np.ptp(J, axis=0).max()) < 0.02:
+            for key, Jseq, col in (("L", L, L_C), ("R", R, R_C)):
+                J = Jseq[ji]
+                # skip absent hands (clip-level frozen-dummy mask + per-frame
+                # degenerate-cluster check)
+                if absent[key] or float(np.ptp(J, axis=0).max()) < 0.02:
                     continue
                 n += draw_skel(im, project(J, extr[ji], intr * scale), col)
             inframe += n > 0
