@@ -661,11 +661,120 @@ class DexcapHdf5Extractor:
         )
 
 
+class OpenTouchHdf5Extractor:
+    """OpenTouch (MIT, arXiv:2512.16842): 26 session .hdf5 files, each ``data/demo_NNN``
+    holding rgb_images_jpeg (T,), camera_poses (T,4,4), right_hand_landmarks (T,21,3)
+    world/SLAM frame (MediaPipe order: wrist 0, tips 4/8/12/16/20), timestamps (T,) ns,
+    labels (1,) [low_light, hand_out_of_frame]; ``calibration/rgb`` gives pinhole
+    focal/pp/size + T_device_camera. Right hand only.
+
+    Conventions (Cat-2.5 audit, 2026-08-20): the landmark->pixel chain is
+    ``p_cam = T_device_camera @ inv(camera_pose_t) @ p_world`` (inframe 1.00 on 3/3 probe
+    clips) => ``w2c_t = T_device_camera @ inv(camera_pose_t)``. Landmarks are HELD-STALE on
+    tracking loss (median 4.3%, p90 16% of frames identical to the previous frame), so
+    per-frame validity is derived: a frame is invalid when its landmarks are bit-identical
+    to the previous frame (the hold repeats garbage, semantically a dropout). Wrist rotation
+    is derived from keypoints (wrist / middle-MCP 9 / index-MCP 5). fps from timestamps.
+
+    Metric-integrity gates (W9 probe, 2026-08-25): sessions are BIMODAL in camera-space
+    wrist depth — ~10 sessions at a plausible 0.50-0.88 m working distance, ~16 sessions
+    at 1.3-1.9 m, beyond human arm reach for the wearer's own hand (per-session SLAM
+    scale inconsistency: u/v projection still locks because the error is along the camera
+    ray, but the 3D is not metric — and Phase-D's population-relative IQR gates would
+    happily keep it). Clips whose median valid wrist depth exceeds ``max_wrist_z`` are
+    rejected at conversion (``depth_implausible``), as are clips the dataset itself labels
+    ``hand_out_of_frame`` (tracker emits garbage while the hand is invisible).
+    """
+
+    def __init__(self, local_dir, sessions=None, stale_eps=1e-12, min_frames=3,
+                 max_wrist_z=1.0, drop_hand_out_of_frame=True):
+        self.local_dir = Path(local_dir)
+        self.sessions = sessions  # optional explicit list of session stems
+        self.stale_eps = float(stale_eps)
+        self.min_frames = int(min_frames)
+        self.max_wrist_z = float(max_wrist_z)
+        self.drop_hand_out_of_frame = bool(drop_hand_out_of_frame)
+
+    def _session_paths(self):
+        if self.sessions:
+            return [self.local_dir / f"{s}.hdf5" for s in self.sessions]
+        return sorted(self.local_dir.glob("*.hdf5"))
+
+    def list_episodes(self, limit=None):
+        import h5py
+        refs = []
+        for p in self._session_paths():
+            with h5py.File(p, "r") as f:
+                for name in sorted(f["data"].keys()):
+                    if f["data"][name]["timestamps"].shape[0] >= self.min_frames:
+                        refs.append(f"{p.stem}::{name}")
+            if limit and len(refs) >= limit:
+                break
+        return refs[:limit] if limit else refs
+
+    def load(self, episode_ref: str, work: Path) -> dict:
+        import h5py
+        session, demo = episode_ref.split("::")
+        with h5py.File(self.local_dir / f"{session}.hdf5", "r") as f:
+            calib = f["calibration/rgb"]
+            focal = float(calib["focal_length"][()])
+            pp = np.asarray(calib["principal_point"], np.float64)
+            T_dev_cam = np.asarray(calib["T_device_camera"], np.float64)
+            clip = f["data"][demo]
+            poses = np.asarray(clip["camera_poses"], np.float64)     # (T,4,4) device pose
+            lms = np.asarray(clip["right_hand_landmarks"], np.float64)  # (T,21,3) world
+            ts = np.asarray(clip["timestamps"], np.int64)
+            jpegs = [bytes(b) for b in clip["rgb_images_jpeg"][:]]
+            labels = clip["labels"][0] if "labels" in clip else None
+        T = min(len(poses), len(lms), len(jpegs), len(ts))
+        poses, lms, jpegs, ts = poses[:T], lms[:T], jpegs[:T], ts[:T]
+
+        if self.drop_hand_out_of_frame and labels is not None and int(labels["hand_out_of_frame"]):
+            raise ValueError("hand_out_of_frame_clip: dataset labels this clip's hand as out of frame")
+
+        w2c = np.einsum("ij,tjk->tik", T_dev_cam, _invert_se3(poses))
+        # derived per-frame validity: stale-held frames (identical to previous) are dropouts
+        finite = np.isfinite(lms).all(axis=(1, 2))
+        stale = np.zeros(T, bool)
+        if T > 1:
+            stale[1:] = np.abs(np.diff(lms, axis=0)).max(axis=(1, 2)) < self.stale_eps
+        valid_r = finite & ~stale
+
+        # metric-integrity gate: wrist depth must be within the wearer's physical reach
+        wrist_cam = np.einsum("tij,tj->ti", w2c[:, :3, :3], lms[:, 0]) + w2c[:, :3, 3]
+        z_valid = wrist_cam[valid_r, 2] if valid_r.any() else wrist_cam[:, 2]
+        med_z = float(np.median(z_valid))
+        if med_z > self.max_wrist_z:
+            raise ValueError(f"depth_implausible: median wrist z {med_z:.2f} m > {self.max_wrist_z} m "
+                             "(per-session SLAM scale inconsistency)")
+
+        rw_t = lms[:, 0]
+        rtips = lms[:, FINGERTIP_INDICES]
+        rw_R = _wrist_frame_from_keypoints(rw_t, lms[:, 9], lms[:, 5])
+        zeros_t = np.zeros((T, 3)); zeros_R = np.tile(np.eye(3), (T, 1, 1))
+        fps = float(1e9 / np.median(np.diff(ts))) if T > 2 else 30.0
+        extra = {"right_hand_only": True, "stale_frames": int(stale.sum())}
+        if labels is not None:
+            extra["session_labels"] = {"low_light": int(labels["low_light"]),
+                                       "hand_out_of_frame": int(labels["hand_out_of_frame"])}
+        return dict(
+            lw_t=zeros_t, rw_t=rw_t,
+            lw_R=zeros_R, rw_R=rw_R,
+            ltips=np.zeros((T, 5, 3)), rtips=rtips,
+            valid_l=np.zeros(T, bool), valid_r=valid_r,
+            w2c=w2c, intr=np.array([focal, focal, pp[0], pp[1]], np.float32), fps=fps,
+            frames=dict(mode="jpeg_list", jpegs=jpegs),
+            task=session, desc="", episode_name=f"{session}_{demo}",
+            extra=extra,
+        )
+
+
 EXTRACTORS = {
     "hawor_npz": HaworNpzExtractor,
     "egoverse_zarr3": EgoverseZarr3Extractor,
     "assemblyhands_coco": AssemblyHandsExtractor,
     "dexcap_hdf5": DexcapHdf5Extractor,
+    "opentouch_hdf5": OpenTouchHdf5Extractor,
 }
 
 
