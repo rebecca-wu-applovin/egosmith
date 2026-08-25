@@ -38,6 +38,11 @@ DATASETS = {
     "hot3d":          {"local": "/root/hot3d/frames"},
     "egodex":         {"local": "/root/egodex/frames"},
     "dexcap":         {"local": "/root/cat2/dexcap/frames"},
+    "arctic":         {"local": "/w6/arctic/full/frames"},
+    "assemblyhands":  {"local": "/w6/assemblyhands/full/frames"},
+    # fmax 16: single short atomic actions (~8s); 16 frames @3fps covers them while keeping
+    # the 12.7K-clip pass inside the labeling budget (px/detail/model/prompt unchanged).
+    "gigahands":      {"local": "/w6/gigahands/full/frames", "fmax": 16},
 }
 OUT_DIR = "/root/egosmith_annotations"
 PX, DETAIL, TARGET_FPS, FMIN, FMAX = 1024, "high", 3.0, 12, 40
@@ -73,7 +78,8 @@ def annotate(ds, rec_json, out_f, err_f):
         d["shard_path"] = tar
         cm = ClipManifestRecord.from_json(json.dumps(rec))
         dur = cm.descriptor.frame_count / float(cm.descriptor.fps or 30)
-        nf = max(FMIN, min(FMAX, round(dur * TARGET_FPS)))
+        fmax = DATASETS.get(ds, {}).get("fmax", FMAX)
+        nf = max(FMIN, min(fmax, round(dur * TARGET_FPS)))
         content, dur2, nsent = build_content(cm, nf, PX, DETAIL)
 
         last_err = None
