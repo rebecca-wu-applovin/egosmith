@@ -61,19 +61,27 @@ def project_bbox(j3d, wo, ho):
     return [x1, y1, x2, y2]
 
 
+def _cat(uri: str, fs) -> bytes | None:
+    if fs is not None:
+        try:
+            return fs.cat_file(uri.replace("gs://", ""))
+        except Exception:  # noqa: BLE001
+            return None
+    import subprocess
+    p = subprocess.run(["gcloud", "storage", "cat", uri], capture_output=True)
+    return p.stdout if p.returncode == 0 and p.stdout else None
+
+
 def episode_recs(ep_uri: str, fs) -> list | None:
     with _cache_lk:
         if ep_uri in _cache:
             return _cache[ep_uri]
     recs = None
     for name in ("hamer_hands.json", "wilor_hands.json"):
-        try:
-            raw = fs.cat_file(f"{ep_uri}/{name}".replace("gs://", ""))
-            if raw:
-                recs = [json.loads(ln) for ln in raw.decode().splitlines() if ln.strip()]
-                break
-        except Exception:  # noqa: BLE001
-            continue
+        raw = _cat(f"{ep_uri}/{name}", fs)
+        if raw:
+            recs = [json.loads(ln) for ln in raw.decode().splitlines() if ln.strip()]
+            break
     with _cache_lk:
         _cache[ep_uri] = recs
     return recs
@@ -127,8 +135,12 @@ def main() -> None:
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
-    import gcsfs
-    fs = gcsfs.GCSFileSystem()
+    try:
+        import gcsfs
+        fs = gcsfs.GCSFileSystem()
+    except ImportError:
+        print("[seed] gcsfs unavailable -> gcloud subprocess fallback", flush=True)
+        fs = None
     rows = [json.loads(l) for l in open(args.manifest) if l.strip()]
 
     counts: dict[str, int] = {}

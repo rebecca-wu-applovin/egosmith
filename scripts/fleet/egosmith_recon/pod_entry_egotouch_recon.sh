@@ -148,6 +148,8 @@ PY
 # tracks_0_N/model_boxes.npy existence makes detect_track --resume skip YOLO.
 gcloud storage cp "$FLEET/seed_tracks_egotouch.py" /tmp/seed_tracks_egotouch.py \
   || { log "FATAL: seeder pull failed"; exit 1; }
+# image lacks gcsfs; best-effort install (seeder falls back to gcloud subprocess)
+python -c "import gcsfs" 2>/dev/null || python -m pip install -q gcsfs 2>&1 | tail -1
 python /tmp/seed_tracks_egotouch.py --manifest "$W/torun.jsonl" --workers 8 2>&1 | tail -4
 SEEDED=$(find "$W/outputs" -name model_boxes.npy | wc -l)
 log "seeded tracks: $SEEDED / $N_RUN clips"
