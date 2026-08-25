@@ -113,21 +113,43 @@ def _valid_hdr(hdr: bytes) -> bool:
     return bool(_NAME_RE.search(name)) or name.startswith(b"WIYH-")
 
 
-def _resync(cf: "ConcatRanged", pos: int, limit: int = 4 * 10**9) -> int | None:
-    """Scan forward from pos (512-aligned windows) for the next valid member
-    header. Bounded: gives up after `limit` bytes. Some scenes carry re-split /
-    overlapping parts (Apartment/Office/Supermarket) that corrupt the chain at
-    part junctions — this skips the damaged span and logs it."""
+def _scan_span(cf: "ConcatRanged", pos: int, limit: int) -> int | None:
+    """Unaligned scan for the next valid member header within [pos, pos+limit)."""
     win = 16 * 1024 * 1024
     scanned = 0
     while scanned < limit and pos + BLK <= cf.total:
-        chunk = cf.read(pos, min(win, cf.total - pos))
-        for off in range(0, len(chunk) - BLK + 1, BLK):
-            hdr = chunk[off:off + BLK]
-            if hdr != b"\0" * BLK and _valid_hdr(hdr):
-                return pos + off
-        pos += len(chunk)
-        scanned += len(chunk)
+        n = min(win, cf.total - pos)
+        chunk = cf.read(pos, n)
+        i = 0
+        while True:
+            i = chunk.find(b"ustar", i)
+            if i < 0 or i - 257 + BLK > len(chunk):
+                break
+            cand = i - 257
+            if cand >= 0 and _valid_hdr(chunk[cand:cand + BLK]):
+                return pos + cand
+            i += 1
+        # overlap windows by 512 so a header straddling the seam isn't missed
+        step = max(1, n - BLK)
+        pos += step
+        scanned += step
+    return None
+
+
+def _resync(cf: "ConcatRanged", pos: int, limit: int = 2 * 10**9) -> int | None:
+    """Find the next valid member header after a damaged span. The odd re-split /
+    overlapping parts (Apartment/Office/Supermarket) can shift alignment by
+    arbitrary byte counts, so the scan is UNALIGNED; if nothing is found near the
+    break, hop to each subsequent part boundary and scan there."""
+    hit = _scan_span(cf, pos, limit)
+    if hit is not None:
+        return hit
+    for s in cf.starts:
+        if s <= pos:
+            continue
+        hit = _scan_span(cf, s, 256 * 1024 * 1024)
+        if hit is not None:
+            return hit
     return None
 
 
