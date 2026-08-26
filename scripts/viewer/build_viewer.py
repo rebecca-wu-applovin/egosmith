@@ -120,15 +120,20 @@ ADAPTERS = {
     # native lowdim (Vision Pro GT); full 21-joint skeletons pulled per clip from the
     # raw EgoDex hdf5s (ranged zip reads, egodex_rawgt.py) — lowdim carries only 6 pts
     "egodex": dict(kind="native", fps=30.0, raw_gt="egodex"),
-    # native lowdim (triangulated GT keypoints baked into frames tars)
-    "assemblyhands": dict(kind="native", fps=30.0),
+}
+
+# Datasets dropped from the shipped set (tombstoned, data preserved on the bucket —
+# see egosmith_filtered/<ds>/DROPPED.md). The root builder skips them even if stale
+# viewer objects resurface.
+DROPPED = {
+    "assemblyhands",  # user-ordered drop 2026-08-26: data-quality concerns
 }
 CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric (recon)",
             "dexycb": "Cat-3 GT", "ho3d_v3": "Cat-3 GT", "show3d": "Cat-3 GT",
             "hoi4d": "Cat-3 GT", "taco": "Cat-3 GT", "oakink_actions": "Cat-3 GT",
             "hot3d": "Cat-3 GT", "arctic": "Cat-3 GT", "h2o": "Cat-3 GT",
             "egodex": "Cat-2 native GT (Vision Pro 21-joint)",
-            "assemblyhands": "Cat-2 native GT", "dexcap": "Cat-2 GT (glove→MANO)",
+            "dexcap": "Cat-2 GT (glove→MANO)",
             # Cat-4 robot datasets (video-only cards, external adapter)
             "trex": "Cat-4 robot", "dexora": "Cat-4 robot", "dexwild": "Cat-4 robot",
             "hrdexdb_allegro": "Cat-4 robot", "realdex": "Cat-4 robot",
@@ -469,6 +474,10 @@ margin-left:.4rem;vertical-align:1px}
 .b-bad{background:rgba(224,122,95,.15);color:var(--bad);border:1px solid rgba(224,122,95,.4)}
 .note{font-size:.78rem;color:var(--bad)}
 .seg{background:var(--panel2);border-radius:6px;padding:.5rem .6rem}
+.seg.seekable{cursor:pointer;border:1px solid transparent}
+.seg.seekable:hover{border-color:var(--acc)}
+.seg.playing{border-color:var(--acc);background:#25314a}
+.play{color:var(--acc);font-weight:600}
 .seg .rng{font-size:.72rem;color:var(--mut);margin-bottom:.25rem}
 .lv{font-size:.8rem;margin:.15rem 0;display:flex;gap:.5rem}
 .lv .lab{flex:0 0 2rem;color:var(--acc);font-weight:600;font-size:.72rem;padding-top:.1rem}
@@ -540,14 +549,17 @@ def _card_html(c):
             q = sg.get("is_good_quality")
             qb = ('<span class="badge b-ok">good</span>' if q
                   else '<span class="badge b-bad">flagged</span>' if q is False else "")
-            rng = ""
+            rng, seek = "", ""
             if sg.get("end") is not None:
-                rng = f'<div class="rng">segment {sg.get("start", 0):g}&ndash;{sg["end"]:g}s{qb}</div>'
+                s0, s1 = sg.get("start", 0), sg["end"]
+                seek = f' data-start="{s0:g}" data-end="{s1:g}"'
+                rng = (f'<div class="rng"><span class="play">&#9654; play segment</span> '
+                       f'{s0:g}&ndash;{s1:g}s{qb}</div>')
             lv = sg.get("language_instructions") or {}
             rows = "".join(f'<div class="lv"><span class="lab">L{i}</span><span>{esc(lv[k])}</span></div>'
                            for i, k in enumerate(("level1", "level2", "level3", "level4"), 1)
                            if lv.get(k))
-            segs_html += f'<div class="seg">{rng}{rows}</div>'
+            segs_html += f'<div class="seg{" seekable" if seek else ""}"{seek}>{rng}{rows}</div>'
     elif c.get("extra_rows"):
         rows = "".join(f'<div class="lv"><span class="lab">{esc(a)}</span><span>{esc(b)}</span></div>'
                        for a, b in c["extra_rows"])
@@ -571,6 +583,26 @@ def _card_html(c):
             f'<div class="meta">{" &middot; ".join(bits)}{raw}</div>{note}{segs_html}</div></figure>')
 
 
+SEG_JS = """
+document.querySelectorAll('.seg.seekable').forEach(function(seg){
+  seg.addEventListener('click', function(){
+    var card = seg.closest('.card'); if(!card) return;
+    var v = card.querySelector('video'); if(!v) return;
+    var s = parseFloat(seg.dataset.start), e = parseFloat(seg.dataset.end);
+    card.querySelectorAll('.seg.playing').forEach(function(x){x.classList.remove('playing')});
+    seg.classList.add('playing');
+    v.currentTime = s; v.loop = false; v.play();
+    if (v._segHandler) v.removeEventListener('timeupdate', v._segHandler);
+    v._segHandler = function(){
+      if (v.currentTime >= e){ v.pause(); v.removeEventListener('timeupdate', v._segHandler);
+        v._segHandler = null; seg.classList.remove('playing'); }
+    };
+    v.addEventListener('timeupdate', v._segHandler);
+  });
+});
+"""
+
+
 def dataset_html(ds, cards, stats):
     chips = "".join(f'<span class="chip">{esc(k)} <b>{esc(v)}</b></span>' for k, v in stats)
     kept = [c for c in cards if c.get("section", "kept") == "kept"]
@@ -591,7 +623,7 @@ def dataset_html(ds, cards, stats):
             f'<div class="legend"><span><span class="dotl"></span>left hand</span>'
             f'<span><span class="dotr"></span>right hand</span></div>'
             f'<div class="stats">{chips}</div><div class="grid">{body}</div>'
-            f'{dropped_html}</body></html>')
+            f'{dropped_html}<script>{SEG_JS}</script></body></html>')
 
 
 def root_html(rows):
@@ -620,7 +652,7 @@ KEPT_HOURS = {
     "egodex": 464.6, "egotouch": 5.0, "wiyh": 2.04,
     "dexycb": 4.36, "show3d": 24.82, "hoi4d": 3.59, "taco": 2.72,
     "ho3d_v3": 0.68, "hot3d": 0.5, "oakink_actions": 6.63,
-    "arctic": 1.61, "assemblyhands": 2.66, "dexcap": 0.79, "h2o": 0.85,
+    "arctic": 1.61, "dexcap": 0.79, "h2o": 0.85,
     "trex": 44.7, "dexora": 39.75, "dexwild": 5.22,
     "hrdexdb_allegro": 0.32, "realdex": 1.16,
 }
@@ -678,7 +710,7 @@ def build_root(work):
     rows = []
     for p in sorted(fs.ls(VIEWER)):
         ds = os.path.basename(p.rstrip("/"))
-        if ds.startswith("_") or ds.endswith(".html"):
+        if ds.startswith("_") or ds.endswith(".html") or ds in DROPPED:
             continue
         try:
             cards = json.loads(fs.open(f"{VIEWER}/{ds}/cards.json", "rb").read())
