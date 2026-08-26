@@ -18,7 +18,7 @@ egosmith_filtered/
 ├── taco/            frames/*.tar   filter_run/{clip_manifest.jsonl, clip_manifest.filtered.jsonl, filter_report.json, FILTER_MODE.txt}
 ├── hot3d/           (same layout)
 ├── oakink_actions/  (same layout; + program_info/)      # OakInk-v2, per-action segments
-├── egodex/          frames/*.tar   filter_run/{clip_manifest.jsonl, clip_manifest.stage1.kept.jsonl, clip_manifest.filtered.jsonl, filter_report.json, FILTER_MODE.txt, _shards/}
+├── egodex/          frames_v2/*.tar (shipped; frames/ = pre-gt_joints v1, kept)   filter_run/{clip_manifest.jsonl, clip_manifest.stage1.kept.jsonl, clip_manifest.filtered.jsonl, filter_report.json, FILTER_MODE.txt, _shards/, _prev21_backup/}
 ├── weights/         (model weights used by the pipeline — not dataset clips)
 ├── scripts/  notebooks/            (tooling — not dataset clips)
 └── README.md        (this file)
@@ -36,7 +36,7 @@ egosmith_filtered/
 | taco | 1,846 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | hot3d | 357 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | oakink_actions | 2,488 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
-| egodex | 158,564 | native — GT read straight from the tar | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` |
+| egodex | 158,564 | native — GT read straight from the tar | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` + `.gt_joints.npy` |
 | h2o | 149 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 
 H2O (ETH, ICCV 2021; egocentric cam4 only, 30 fps, two-hands+object tabletop manipulation;
@@ -52,12 +52,35 @@ video (raw-target projection proof; converter exonerated at 5.7–7.0 mm fit). M
 finger-level targets in training; wrist pose, video, and language annotations are reliable.
 Evidence: `egosmith_filtered/_audits/handedness_audit_2026-08-25/`.
 
+## Dropped datasets
+
+Tombstoned — bucket contents preserved as-is under `egosmith_filtered/<ds>/` with a
+`DROPPED.md`, but **not part of the shipped set** (excluded from the viewer root and from
+any combined-manifest training builds):
+
+- **assemblyhands** — user-ordered drop 2026-08-26 (data-quality concerns). 477 frame tars +
+  filter_run kept in place; see `egosmith_filtered/assemblyhands/DROPPED.md`.
+
 All GT here is **ground truth, not pixel-estimated**. For taco/hot3d/oakink the datasets ship GT
 MANO + GT camera, which the converter packages into the pipeline's canonical world-space
 `world_space_res.pth` (GT re-expressed, no SLAM/HaWoR estimation). A video-only reconstruction
 track (pose estimated from pixels) existed but was dropped — it had scale artifacts.
 
 EgoDex funnel: 338,234 converted → 177,979 Layer‑1 → **158,564** Layer‑4.
+
+**EgoDex full-articulation GT (`.gt_joints.npy`, retrofit 2026-08-26):** every shipped egodex
+tar carries one extra member per frame — `{frame}.gt_joints.npy` = **(2, 21, 3) float32**
+world-frame joint positions of the full Vision Pro hand skeleton, MANO joint order
+(index 0 = left hand; per hand: wrist, then per finger Knuckle/IntermediateBase/
+IntermediateTip/Tip for thumb→little; tips at 4,8,12,16,20). Schema tag
+`descriptor.extra["gt_joints_schema"] = "vp_world_21_mano_order_v1"`, flag
+`extra["gt_joints"] = true`. `.mano.npy` remains the zeros (2,55) placeholder for format
+compatibility (`extra["mano_note"]`); the 116-d `.lowdim.npy` is unchanged (wrist+5 tips are
+an exact subset of `gt_joints` — validated per clip at conversion, max err 0.0). Per-frame
+`presence` in `.meta.json` still gates hand validity. Shipped tars live under `frames_v2/`
+(append-only rewrite of v1; original member bytes/offsets preserved verbatim, so
+`frame_offsets` stayed valid); the pre-retrofit manifest is backed up at
+`filter_run/_prev21_backup/`. Built by `scripts/build/retrofit_egodex_gt_joints.py`.
 
 ## Record / descriptor schema
 
@@ -80,7 +103,9 @@ The single loader `load_descriptor_episode_features`
 `descriptor.extra["native_feature_source"]`:
 
 - **native** (`== "wds_lowdim_mano_v1"`, EgoDex): per-frame GT read **from the tar** —
-  `.lowdim.npy` (116‑d Vision‑Pro world pose) + `.mano.npy`. `seq_folder` unused.
+  `.lowdim.npy` (116‑d Vision‑Pro world pose) + `.mano.npy` + `.gt_joints.npy`
+  (full 21-joint articulation, see above; the loader's lowdim path ignores members it
+  doesn't know, so `gt_joints` is opt-in). `seq_folder` unused.
 - **use_gt** (taco/hot3d/oakink_actions): the dataset's **GT** world-space MANO pose, stored in
   `seq_folder/world_space_res.pth` (`trans/rot/hand_pose/betas`, 2 hands × T), then MANO forward →
   lowdim features. This is GT-derived (GT MANO + GT camera converted to canonical world space) — not
