@@ -582,36 +582,55 @@ def dataset_html(ds, cards, stats):
 def root_html(rows):
     trs = "".join(
         f'<tr><td><a href="{AUTH_BASE}/{esc(ds)}/index.html">{esc(ds)}</a></td><td>{esc(cat)}</td>'
-        f'<td class="num">{n}</td><td class="num">{ov}</td><td>{esc(extra)}</td></tr>'
-        for ds, cat, n, ov, extra in rows)
+        f'<td class="num"><b>{esc(hours)}</b></td>'
+        f'<td class="num">{n}</td><td class="num">{ov}</td></tr>'
+        for ds, cat, hours, n, ov in rows)
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<title>EgoSmith filtered data viewer</title><style>{CSS}</style></head><body>'
             f'<h1>EgoSmith filtered data viewer</h1>'
             f'<div class="sub">Sampled instances per dataset: video &middot; reconstructed '
             f'keypoints overlaid &middot; LLM annotation (L1&ndash;L4)</div>'
-            f'<table><tr><th>dataset</th><th>category</th><th>cards</th><th>with overlay</th>'
-            f'<th>dataset stats</th></tr>{trs}</table></body></html>')
+            f'<table><tr><th>dataset</th><th>category</th><th>kept hours</th><th>cards</th>'
+            f'<th>with overlay</th></tr>{trs}</table></body></html>')
+
+
+# Kept hours per dataset (bucket-audited; funnel.json overrides when present).
+# Sources: funnels (100k/10k/egotouch/wiyh), the Cat-1 conveyor completion report,
+# per-manifest frame/fps sums (Cat-3, robots from QC reports).
+KEPT_HOURS = {
+    "egocentric100k": 24960, "egocentric10k": 2622,
+    "ego4d": 335.3, "holoassist": 50.3, "epic_kitchens_100": 26.8,
+    "assembly101": 23.5, "hd_epic": 3.5, "egoverse_aria": 5.9,
+    "egodex": 464.6, "egotouch": 5.0, "wiyh": 2.04,
+    "dexycb": 4.36, "show3d": 24.82, "hoi4d": 3.59, "taco": 2.72,
+    "ho3d_v3": 0.68, "hot3d": 0.5, "oakink_actions": 6.63,
+    "arctic": 1.61, "assemblyhands": 2.66, "dexcap": 0.79, "h2o": 0.85,
+    "trex": 44.7, "dexora": 39.75, "dexwild": 5.22,
+    "hrdexdb_allegro": 0.32, "realdex": 1.16,
+}
+
+
+def dataset_kept_hours(ds, ad):
+    try:
+        fp = (ad or {}).get("funnel") or f"{BUCKET}/egosmith_filtered/{ds}/filter_run/funnel.json"
+        if fs.exists(fp):
+            fn = json.loads(fs.open(fp, "rb").read())
+            h = fn.get("final_hours", fn.get("final_kept_hours", fn.get("kept_hours")))
+            if h:
+                return float(h)
+    except Exception:  # noqa: BLE001
+        pass
+    return KEPT_HOURS.get(ds)
 
 
 def dataset_stats(ds, ad, cards):
-    stats = [("cards", len(cards)),
-             ("with overlay", sum(1 for c in cards if c["status"] == "overlay"))]
-    try:
-        if ad and ad.get("funnel") and fs.exists(ad["funnel"]):
-            fn = json.loads(fs.open(ad["funnel"], "rb").read())
-            hours = fn.get("final_hours", fn.get("final_kept_hours"))
-            stats.append(("kept clips", f"{fn['final_kept_clips']:,}"))
-            if hours is not None:
-                stats.append(("kept hours", f"{hours:,}"))
-        elif ad and ad["kind"] in ("cat3", "native", "hot3d_viz"):
-            rep = f"{BUCKET}/egosmith_filtered/{ds}/filter_run/filter_report.json"
-            if fs.exists(rep):
-                r = json.loads(fs.open(rep, "rb").read())
-                if r.get("kept_clips"):
-                    stats.append(("kept clips", f"{r['kept_clips']:,}"))
-    except Exception:  # noqa: BLE001
-        pass
+    stats = []
+    h = dataset_kept_hours(ds, ad)
+    if h is not None:
+        stats.append(("kept hours", f"{h:,.2f}" if h < 100 else f"{h:,.0f}"))
+    stats += [("cards", len(cards)),
+              ("with overlay", sum(1 for c in cards if c["status"] == "overlay"))]
     return stats
 
 
@@ -651,9 +670,9 @@ def build_root(work):
         except Exception:  # noqa: BLE001
             continue
         ov = sum(1 for c in cards if c["status"] == "overlay")
-        stats = dataset_stats(ds, ADAPTERS.get(ds), cards)
-        extra = " · ".join(f"{k}: {v}" for k, v in stats[2:])
-        rows.append((ds, CATEGORY.get(ds, "—"), len(cards), ov, extra))
+        h = dataset_kept_hours(ds, ADAPTERS.get(ds))
+        hours = ("—" if h is None else f"{h:,.2f}" if h < 100 else f"{h:,.0f}")
+        rows.append((ds, CATEGORY.get(ds, "—"), hours, len(cards), ov))
     out = work / "index.html"
     out.write_text(root_html(rows))
     subprocess.run(["gcloud", "storage", "cp", "--content-type=text/html", "-q",
