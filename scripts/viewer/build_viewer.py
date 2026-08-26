@@ -95,8 +95,8 @@ ADAPTERS = {
     "hoi4d": dict(kind="cat3", fps=30.0,
                   outputs=f"{BUCKET}/egosmith_filtered/hoi4d/outputs"),
     # Cat-3, GT-mode recon under egosmith_recon/<ds>/use_gt/outputs/
-    "taco": dict(kind="cat3", outputs=f"{BUCKET}/egosmith_recon/taco/use_gt/outputs"),
-    "oakink_actions": dict(kind="cat3",
+    "taco": dict(kind="cat3", fps=30.0, outputs=f"{BUCKET}/egosmith_recon/taco/use_gt/outputs"),
+    "oakink_actions": dict(kind="cat3", fps=30.0,
                            outputs=f"{BUCKET}/egosmith_recon/oakink_actions/use_gt/outputs"),
     # Cat-3, GT-mode recon under egosmith_recon/<ds>/use_gt/outputs/
     "arctic": dict(kind="cat3", fps=30.0,
