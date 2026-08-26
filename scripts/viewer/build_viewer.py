@@ -474,6 +474,9 @@ margin-left:.4rem;vertical-align:1px}
 .b-bad{background:rgba(224,122,95,.15);color:var(--bad);border:1px solid rgba(224,122,95,.4)}
 .note{font-size:.78rem;color:var(--bad)}
 .seg{background:var(--panel2);border-radius:6px;padding:.5rem .6rem}
+.segblock{margin:.6rem 0;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.segblock video{width:100%;display:block;background:#000}
+.segblock .seg{border-radius:0}
 .seg.seekable{cursor:pointer;border:1px solid transparent}
 .seg.seekable:hover{border-color:var(--acc)}
 .seg.playing{border-color:var(--acc);background:#25314a}
@@ -500,6 +503,27 @@ EMBED_MAX_BYTES = 900_000   # embed as-is under this; re-encode smaller above it
 
 
 EMBED_CAP_SEC = 8
+
+
+def _segment_uri(mp4_path, start, end):
+    """data:video/mp4 URI for one annotation segment, cut+re-encoded from the card mp4
+    (360p cap, crf 28 — segments partition the clip, so total page weight stays flat)."""
+    import base64
+    import tempfile
+    import imageio_ffmpeg
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as t:
+        tmp = t.name
+    dur = max(0.3, end - start)
+    subprocess.run([ff, "-y", "-loglevel", "error", "-ss", f"{start:.2f}", "-t", f"{dur:.2f}",
+                    "-i", str(mp4_path), "-vf", "scale=-2:'min(360,ih)'", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", "-crf", "28", "-movflags", "+faststart",
+                    "-an", tmp], check=True, capture_output=True)
+    data = Path(tmp).read_bytes()
+    os.unlink(tmp)
+    if not data:
+        raise RuntimeError("empty segment cut")
+    return "data:video/mp4;base64," + base64.b64encode(data).decode()
 
 
 def _embed_uri(mp4_path):
@@ -577,6 +601,26 @@ def _card_html(c):
         raw = (f' &middot; <span class="badge b-bad">preview: first {EMBED_CAP_SEC}s'
                + (f" of {dur:g}s" if dur else "") + "</span>"
                + f' &middot; <a href="{esc(c["raw_url"])}">full video &nearr;</a>')
+    if c.get("seg_videos"):
+        blocks = ""
+        for i, sv in enumerate(c["seg_videos"], 1):
+            sg = sv["seg"]
+            q = sg.get("is_good_quality")
+            qb = ('<span class="badge b-ok">good</span>' if q
+                  else '<span class="badge b-bad">flagged</span>' if q is False else "")
+            lv = sg.get("language_instructions") or {}
+            rows = "".join(
+                f'<div class="lv"><span class="lab">L{j}</span><span>{esc(lv[k])}</span></div>'
+                for j, k in enumerate(("level1", "level2", "level3", "level4"), 1) if lv.get(k))
+            blocks += (f'<div class="segblock"><video controls muted playsinline '
+                       f'preload="metadata" src="{sv["uri"]}"></video>'
+                       f'<div class="seg"><div class="rng">segment {i} &middot; '
+                       f'{sg.get("start", 0):g}&ndash;{sg["end"]:g}s{qb}</div>{rows}</div></div>')
+        return (f'<figure class="card"><div class="body">'
+                f'<div class="cid">{esc(c["clip_id"])}{badge}</div>'
+                f'<div class="meta">{" &middot; ".join(bits)}'
+                f' &middot; <a href="{esc(c["raw_url"])}">full clip &nearr;</a></div>'
+                f'{note}{blocks}</div></figure>')
     return (f'<figure class="card"><video controls loop muted playsinline preload="metadata" '
             f'src="{src}"></video><div class="body">'
             f'<div class="cid">{esc(c["clip_id"])}{badge}</div>'
@@ -687,8 +731,22 @@ def publish(ds, work, upload_clips=True):
     for c in cards:
         mp4 = wdir / c["video"]
         if mp4.exists():
-            c["video_uri"], c["embed_truncated"] = _embed_uri(mp4)
             c["raw_url"] = f"{AUTH_BASE}/{ds}/{c['video']}"
+            segs = ((c.get("annotation") or {}).get("segments")) or []
+            timed = [sg for sg in segs if sg.get("end") is not None]
+            if timed:
+                # one video per annotated segment, annotation rendered beneath each
+                c["seg_videos"] = []
+                for sg in timed:
+                    s0 = float(sg.get("start", 0)); s1 = float(sg["end"])
+                    try:
+                        uri = _segment_uri(mp4, s0, s1)
+                    except Exception:  # noqa: BLE001  (corrupt cut -> whole-clip card)
+                        c["seg_videos"] = None
+                        break
+                    c["seg_videos"].append({"uri": uri, "seg": sg})
+            if not c.get("seg_videos"):
+                c["video_uri"], c["embed_truncated"] = _embed_uri(mp4)
     stats = dataset_stats(ds, ADAPTERS.get(ds), cards)
     page = wdir / "index.html"
     page.write_text(dataset_html(ds, cards, stats))
