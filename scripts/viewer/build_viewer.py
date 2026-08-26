@@ -117,8 +117,9 @@ ADAPTERS = {
                  shards_k=60),
     # hot3d ships pre-rendered viz/*.overlay.mp4 — copy, don't re-render
     "hot3d": dict(kind="hot3d_viz"),
-    # native lowdim (Vision Pro GT) — overlay straight from .lowdim.npy
-    "egodex": dict(kind="native", fps=30.0),
+    # native lowdim (Vision Pro GT); full 21-joint skeletons pulled per clip from the
+    # raw EgoDex hdf5s (ranged zip reads, egodex_rawgt.py) — lowdim carries only 6 pts
+    "egodex": dict(kind="native", fps=30.0, raw_gt="egodex"),
     # native lowdim (triangulated GT keypoints baked into frames tars)
     "assemblyhands": dict(kind="native", fps=30.0),
 }
@@ -126,7 +127,7 @@ CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric
             "dexycb": "Cat-3 GT", "ho3d_v3": "Cat-3 GT", "show3d": "Cat-3 GT",
             "hoi4d": "Cat-3 GT", "taco": "Cat-3 GT", "oakink_actions": "Cat-3 GT",
             "hot3d": "Cat-3 GT", "arctic": "Cat-3 GT", "h2o": "Cat-3 GT",
-            "egodex": "Cat-2 native GT",
+            "egodex": "Cat-2 native GT (Vision Pro 21-joint)",
             "assemblyhands": "Cat-2 native GT", "dexcap": "Cat-2 GT (glove→MANO)",
             # Cat-4 robot datasets (video-only cards, external adapter)
             "trex": "Cat-4 robot", "dexora": "Cat-4 robot", "dexwild": "Cat-4 robot",
@@ -362,6 +363,11 @@ def render_dataset(ds, n, seed, work):
             seq = None
         return tar_local, seq
 
+    rawgt = None
+    if ad.get("raw_gt") == "egodex":
+        from egodex_rawgt import EgoDexRawGT
+        rawgt = EgoDexRawGT(fs=fs)
+
     pool = ThreadPoolExecutor(6)
     fetched = list(pool.map(lambda s: _safe(fetch, s), samples))
     for s, f in zip(samples, fetched):
@@ -374,12 +380,18 @@ def render_dataset(ds, n, seed, work):
         fps = float(d.get("fps") or d.get("extra", {}).get("recon_fps")
                     or ad.get("fps") or 15.0)
         out = clips_dir / f"{cid}.mp4"
+        gtj, gt_err = None, None
+        if rawgt is not None:
+            try:
+                gtj = rawgt.joints(cid)
+            except Exception as e:  # noqa: BLE001
+                gt_err = f"raw GT unavailable: {type(e).__name__}: {str(e)[:120]}"
         try:
             # one retry: transient ffmpeg broken-pipes under batch memory pressure
             for attempt in (0, 1):
                 try:
                     if ad["kind"] == "native":
-                        st = render_native_overlay(tar_local, out, fps)
+                        st = render_native_overlay(tar_local, out, fps, gt_joints=gtj)
                     else:
                         st = render_recon_overlay(tar_local, seq, out, fps)
                     break
@@ -395,10 +407,13 @@ def render_dataset(ds, n, seed, work):
                 continue
         finally:
             tar_local.unlink(missing_ok=True)
+        if gt_err and not st.get("note"):
+            st["note"] = gt_err + " -> 6-pt overlay"
         cards.append(dict(clip_id=cid, video=f"clips/{cid}.mp4", status=st["status"],
                           note=st.get("note"), section=s.get("section", "kept"),
                           reasons=s.get("reasons", []),
-                          meta={k: st.get(k) for k in ("dur_s", "fps", "w", "h", "hand_pct")},
+                          meta={k: st.get(k) for k in
+                                ("dur_s", "fps", "w", "h", "hand_pct", "gt_align_px")},
                           annotation=(s["ann"] or {}).get("annotation"),
                           extra_rows=[]))
         print(f"[{ds}] {len(cards)}/{len(samples)} {cid} {st['status']} {s.get('section')}",

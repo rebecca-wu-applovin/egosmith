@@ -14,6 +14,7 @@ upscaled to >= MIN_W wide with the intrinsic scaled identically.
 import io
 import math
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -229,9 +230,53 @@ def _native_mano_joints(lds, manos):
     return out[0], out[1]
 
 
-def render_native_overlay(tar_path, out_mp4, fps=30.0):
-    """Native-lowdim overlay. Full 21-joint skeletons when .mano.npy ships in the tar
-    (EgoDex); wrist+fingertips fallback otherwise (keypoints-only datasets)."""
+GT_TIP_IDX = [4, 8, 12, 16, 20]  # MANO-order fingertip indices (thumb..little)
+GT_ALIGN_MAX_PX = 5.0
+
+
+def _gt_align_px(lds, jpg_names, gt_joints):
+    """Median projected px distance between the lowdim's own wrist+5tips and the same
+    6 points taken from the raw-GT 21-joint skeletons (both world-frame, projected
+    through the lowdim's per-frame w2c+intrinsics). Should be ~0 when the raw hdf5
+    frames line up 1:1 with the tar frames."""
+    errs = []
+    for ld, name in zip(lds, jpg_names):
+        if ld is None:
+            continue
+        ld = ld.reshape(-1)
+        if ld.shape[-1] < 116:
+            continue
+        m = re.search(r"_f(\d+)\.image\.jpg$", name)
+        t = int(m.group(1)) if m else None
+        if t is None:
+            continue
+        w2c = ld[LD_EXTR].reshape(4, 4)
+        fx, fy, cx, cy = ld[LD_INTR]
+
+        def _uv(pts):
+            homo = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)
+            cam = (w2c @ homo.T).T[:, :3]
+            z = np.clip(cam[:, 2:3], 1e-6, None)
+            return np.concatenate([fx * cam[:, :1] / z + cx,
+                                   fy * cam[:, 1:2] / z + cy], axis=1)
+
+        for J, sl_w, sl_t in ((gt_joints[0], LD_LWRIST, LD_LTIPS),
+                              (gt_joints[1], LD_RWRIST, LD_RTIPS)):
+            wrist = ld[sl_w].reshape(1, 3)
+            if t >= J.shape[0] or np.abs(wrist).max() < 1e-8:
+                continue
+            ld6 = np.concatenate([wrist, ld[sl_t].reshape(5, 3)])
+            gt6 = J[t][[0] + GT_TIP_IDX]
+            if not (np.isfinite(ld6).all() and np.isfinite(gt6).all()):
+                continue
+            errs += list(np.linalg.norm(_uv(ld6) - _uv(gt6), axis=1))
+    return float(np.median(errs)) if errs else None
+
+
+def render_native_overlay(tar_path, out_mp4, fps=30.0, gt_joints=None):
+    """Native-lowdim overlay. Full 21-joint skeletons when raw-GT world joints are
+    supplied (EgoDex raw hdf5, egodex_rawgt.py) or real .mano.npy ships in the tar;
+    wrist+fingertips fallback otherwise (keypoints-only datasets)."""
     frames, lds = load_tar_frames(tar_path)
     if not frames:
         raise RuntimeError(f"no frames in {tar_path}")
@@ -239,10 +284,18 @@ def render_native_overlay(tar_path, out_mp4, fps=30.0):
         raise RuntimeError(f"no .lowdim.npy members in {tar_path}")
     with tarfile.open(tar_path) as tf:
         jpg_names = sorted(n for n in tf.getnames() if n.endswith(".image.jpg"))
-    manos = _load_tar_manos(tar_path, jpg_names)
+    note, gt_align = None, None
     joints = None
+    if gt_joints is not None:
+        # raw-GT skeletons index by SOURCE frame number (tar frames are 1:1 with the
+        # hdf5 timesteps) — validate by matching the lowdim's own wrist+tips
+        gt_align = _gt_align_px(lds, jpg_names, gt_joints)
+        if gt_align is None or gt_align > GT_ALIGN_MAX_PX:
+            note = f"raw GT misaligned (median {gt_align} px > {GT_ALIGN_MAX_PX}) -> 6-pt fallback"
+            gt_joints = None
+    manos = _load_tar_manos(tar_path, jpg_names)
     # zeros_2x55 schema = placeholder, not real MANO (e.g. EgoDex) -> 6-pt fallback
-    if manos is not None and all(m is not None for m in manos) \
+    if gt_joints is None and manos is not None and all(m is not None for m in manos) \
             and all(l is not None for l in lds) \
             and max(float(np.abs(np.asarray(m)).max()) for m in manos) > 1e-8:
         try:
@@ -253,7 +306,7 @@ def render_native_overlay(tar_path, out_mp4, fps=30.0):
     scale, W, H = _upscale(w, h)
     wr = _writer(out_mp4, W, H, fps)
     inframe = 0
-    for t, (im, ld) in enumerate(zip(frames, lds)):
+    for t, (im, ld, jname) in enumerate(zip(frames, lds, jpg_names)):
         im = cv2.resize(im, (W, H), interpolation=cv2.INTER_CUBIC)
         n = 0
         if ld is not None and ld.shape[-1] >= 116:
@@ -268,12 +321,16 @@ def render_native_overlay(tar_path, out_mp4, fps=30.0):
                 return np.concatenate(
                     [fx * cam[:, :1] / z + cx, fy * cam[:, 1:2] / z + cy, z], axis=1)
 
+            gm = re.search(r"_f(\d+)\.image\.jpg$", jname)
+            gt_t = int(gm.group(1)) if gm else t
             for hi, (sl_w, sl_t, col) in enumerate(
                     ((LD_LWRIST, LD_LTIPS, L_C), (LD_RWRIST, LD_RTIPS, R_C))):
                 wrist = ld[sl_w].reshape(1, 3)
                 if not np.isfinite(wrist).all() or np.abs(wrist).max() < 1e-8:
                     continue  # absent hand (presence bitmask semantics)
-                if joints is not None:
+                if gt_joints is not None and gt_t < gt_joints[hi].shape[0]:
+                    n += draw_skel(im, _proj(gt_joints[hi][gt_t]), col)
+                elif joints is not None:
                     n += draw_skel(im, _proj(joints[hi][t]), col)
                 else:
                     pts = np.concatenate([wrist, ld[sl_t].reshape(5, 3)])
@@ -283,8 +340,9 @@ def render_native_overlay(tar_path, out_mp4, fps=30.0):
         inframe += n > 0
         wr.send(np.ascontiguousarray(im))
     wr.close()
-    return {"status": "overlay", "note": None, "frames": len(frames), "fps": fps,
+    return {"status": "overlay", "note": note, "frames": len(frames), "fps": fps,
             "w": w, "h": h, "dur_s": round(len(frames) / fps, 2),
+            "gt_align_px": None if gt_align is None else round(gt_align, 3),
             "hand_pct": round(100 * inframe / len(frames), 1)}
 
 
