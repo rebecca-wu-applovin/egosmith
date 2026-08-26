@@ -168,33 +168,118 @@ def render_recon_overlay(tar_path, seq_folder, out_mp4, fps=15.0):
             "hand_pct": round(100 * inframe / T_img, 1) if status == "overlay" else None}
 
 
+def _load_tar_manos(tar_path, jpg_names):
+    """Per-frame (2,55) MANO samples matching the jpg order, or None if absent."""
+    manos = {}
+    with tarfile.open(tar_path) as tf:
+        for m in tf:
+            if m.name.endswith(".mano.npy"):
+                manos[m.name] = np.load(io.BytesIO(tf.extractfile(m).read()))
+    if not manos:
+        return None
+    out = [manos.get(j[: -len(".image.jpg")] + ".mano.npy") for j in jpg_names]
+    return out if any(v is not None for v in out) else None
+
+
+def _rot6d_to_aa(r6):
+    """rot6d (Gram-Schmidt columns) -> axis-angle (3,)."""
+    a1, a2 = r6[:3], r6[3:6]
+    b1 = a1 / max(np.linalg.norm(a1), 1e-8)
+    b2 = a2 - np.dot(b1, a2) * b1
+    b2 = b2 / max(np.linalg.norm(b2), 1e-8)
+    b3 = np.cross(b1, b2)
+    R = np.stack([b1, b2, b3], axis=1)
+    aa, _ = cv2.Rodrigues(R.astype(np.float64))
+    return aa.reshape(3).astype(np.float32)
+
+
+def _native_mano_joints(lds, manos):
+    """Full 21-joint world skeletons from .mano.npy (PCA45+betas) + lowdim wrist/rot6d.
+
+    Reuses the pipeline's own MANO forward (mano_features._compute_hand_joints) so the
+    viewer renders exactly the joints training would see. Returns (L, R), each (T,21,3)
+    world, anchored so joint0 == lowdim wrist (mano_joint_0_world semantics)."""
+    import torch
+    from lib.pipeline.exporters.mano_features import build_mano_models, _compute_hand_joints
+    from lib.pipeline.exporters.mano_codec import hand_pose_pca_to_axis_angle
+    T = len(lds)
+    trans = np.zeros((2, T, 3), np.float32)
+    rot = np.zeros((2, T, 3), np.float32)
+    pose = np.zeros((2, T, 45), np.float32)
+    betas = np.zeros((2, T, 10), np.float32)
+    wrists = np.zeros((2, T, 3), np.float32)
+    for t, (ld, mn) in enumerate(zip(lds, manos)):
+        ld = ld.reshape(-1)
+        mn = np.asarray(mn).reshape(2, 55)
+        wrists[0, t], wrists[1, t] = ld[0:3], ld[3:6]
+        rot[0, t], rot[1, t] = _rot6d_to_aa(ld[6:12]), _rot6d_to_aa(ld[12:18])
+        for hi, side in ((0, "left"), (1, "right")):
+            pose[hi, t] = hand_pose_pca_to_axis_angle(mn[hi, :45], side=side)
+            betas[hi, t] = mn[hi, 45:]
+    dev = _device()
+    mano_r, mano_l = build_mano_models(dev)
+    tt = lambda a: torch.from_numpy(a)
+    out = []
+    for hi, model in ((0, mano_l), (1, mano_r)):
+        J = _compute_hand_joints(model, tt(trans), tt(rot), tt(pose), tt(betas),
+                                 hand_index=hi, device=dev)
+        J = J.detach().cpu().numpy()
+        J = J - J[:, :1, :] + wrists[hi][:, None, :]  # anchor joint0 at lowdim wrist
+        out.append(J)
+    return out[0], out[1]
+
+
 def render_native_overlay(tar_path, out_mp4, fps=30.0):
-    """Native-lowdim overlay (wrist+fingertips per hand from .lowdim.npy per frame)."""
+    """Native-lowdim overlay. Full 21-joint skeletons when .mano.npy ships in the tar
+    (EgoDex); wrist+fingertips fallback otherwise (keypoints-only datasets)."""
     frames, lds = load_tar_frames(tar_path)
     if not frames:
         raise RuntimeError(f"no frames in {tar_path}")
     if not lds or all(v is None for v in lds):
         raise RuntimeError(f"no .lowdim.npy members in {tar_path}")
+    with tarfile.open(tar_path) as tf:
+        jpg_names = sorted(n for n in tf.getnames() if n.endswith(".image.jpg"))
+    manos = _load_tar_manos(tar_path, jpg_names)
+    joints = None
+    # zeros_2x55 schema = placeholder, not real MANO (e.g. EgoDex) -> 6-pt fallback
+    if manos is not None and all(m is not None for m in manos) \
+            and all(l is not None for l in lds) \
+            and max(float(np.abs(np.asarray(m)).max()) for m in manos) > 1e-8:
+        try:
+            joints = _native_mano_joints(lds, manos)
+        except Exception:  # noqa: BLE001  (fall back to 6-pt on any decode issue)
+            joints = None
     h, w = frames[0].shape[:2]
     scale, W, H = _upscale(w, h)
     wr = _writer(out_mp4, W, H, fps)
     inframe = 0
-    for im, ld in zip(frames, lds):
+    for t, (im, ld) in enumerate(zip(frames, lds)):
         im = cv2.resize(im, (W, H), interpolation=cv2.INTER_CUBIC)
         n = 0
         if ld is not None and ld.shape[-1] >= 116:
             ld = ld.reshape(-1)
             w2c = ld[LD_EXTR].reshape(4, 4)
             fx, fy, cx, cy = ld[LD_INTR] * scale
-            for sl_w, sl_t, col in ((LD_LWRIST, LD_LTIPS, L_C), (LD_RWRIST, LD_RTIPS, R_C)):
-                pts = np.concatenate([ld[sl_w].reshape(1, 3), ld[sl_t].reshape(5, 3)])
-                if not np.isfinite(pts).all() or np.abs(pts).max() < 1e-8:
-                    continue
-                homo = np.concatenate([pts, np.ones((6, 1))], axis=1)
+
+            def _proj(pts):
+                homo = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)
                 cam = (w2c @ homo.T).T[:, :3]
                 z = np.clip(cam[:, 2:3], 1e-6, None)
-                uvz = np.concatenate([fx * cam[:, :1] / z + cx, fy * cam[:, 1:2] / z + cy, z], axis=1)
-                n += draw_hand6(im, uvz, col)
+                return np.concatenate(
+                    [fx * cam[:, :1] / z + cx, fy * cam[:, 1:2] / z + cy, z], axis=1)
+
+            for hi, (sl_w, sl_t, col) in enumerate(
+                    ((LD_LWRIST, LD_LTIPS, L_C), (LD_RWRIST, LD_RTIPS, R_C))):
+                wrist = ld[sl_w].reshape(1, 3)
+                if not np.isfinite(wrist).all() or np.abs(wrist).max() < 1e-8:
+                    continue  # absent hand (presence bitmask semantics)
+                if joints is not None:
+                    n += draw_skel(im, _proj(joints[hi][t]), col)
+                else:
+                    pts = np.concatenate([wrist, ld[sl_t].reshape(5, 3)])
+                    if not np.isfinite(pts).all():
+                        continue
+                    n += draw_hand6(im, _proj(pts), col)
         inframe += n > 0
         wr.send(np.ascontiguousarray(im))
     wr.close()
