@@ -647,7 +647,7 @@ def publish(ds, work, upload_clips=True):
     page.write_text(dataset_html(ds, cards, stats))
     print(f"[{ds}] page size {page.stat().st_size/1e6:.1f} MB", flush=True)
     dst = f"gs://{VIEWER}/{ds}"
-    subprocess.run(["gcloud", "storage", "cp", "--content-type=text/html", "-q",
+    subprocess.run(["gcloud", "storage", "cp", "--content-type=text/html", "--cache-control=no-store", "-q",
                     str(page), f"{dst}/index.html"], check=True)
     if upload_clips:
         subprocess.run(["gcloud", "storage", "cp", "--content-type=video/mp4", "-q"]
@@ -675,7 +675,7 @@ def build_root(work):
         rows.append((ds, CATEGORY.get(ds, "—"), hours, len(cards), ov))
     out = work / "index.html"
     out.write_text(root_html(rows))
-    subprocess.run(["gcloud", "storage", "cp", "--content-type=text/html", "-q",
+    subprocess.run(["gcloud", "storage", "cp", "--content-type=text/html", "--cache-control=no-store", "-q",
                     str(out), f"gs://{VIEWER}/index.html"], check=True)
     print(f"root -> https://storage.cloud.google.com/{VIEWER}/index.html", flush=True)
 
