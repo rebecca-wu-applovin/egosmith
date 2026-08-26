@@ -107,6 +107,14 @@ ADAPTERS = {
     # W9: H2O egocentric cam4, GT MANO+camera (use_gt)
     "h2o": dict(kind="cat3", fps=30.0,
                 outputs=f"{BUCKET}/egosmith_recon/h2o/use_gt/outputs"),
+    # WIYH: sharded ego layout but SINGLE annotations.v4.jsonl; native 10fps
+    "wiyh": dict(kind="ego", fps=10.0,
+                 filt=f"{BUCKET}/egosmith_filtered/wiyh/filter_run/_shards",
+                 ann_file=f"{BUCKET}/egosmith_filtered/wiyh/filter_run/annotations.v4.jsonl",
+                 frames=f"{BUCKET}/egosmith_filtered/wiyh/frames",
+                 recon=f"{BUCKET}/egosmith_recon/wiyh/recon/outputs",
+                 funnel=f"{BUCKET}/egosmith_filtered/wiyh/filter_run/funnel.json",
+                 shards_k=60),
     # hot3d ships pre-rendered viz/*.overlay.mp4 — copy, don't re-render
     "hot3d": dict(kind="hot3d_viz"),
     # native lowdim (Vision Pro GT) — overlay straight from .lowdim.npy
@@ -127,7 +135,8 @@ CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric
             "assembly101": "Cat-1 (recon)", "hd_epic": "Cat-1 (recon)",
             "holoassist": "Cat-1 (recon)", "ego4d": "Cat-1 (recon)",
             "epic_kitchens_100": "Cat-1 (recon)", "egoverse_aria": "Cat-1 (recon)",
-            "egotouch": "Cat-1 (seeded recon, gloved hands)"}
+            "egotouch": "Cat-1 (seeded recon, gloved hands)",
+            "wiyh": "Cat-2 (recon, exoskeleton hands — 0.37% keep)"}
 
 
 def _read_jsonl_gcs(path):
@@ -159,11 +168,16 @@ def load_annotations(ds, ad):
 def sample_ego(ds, ad, n, seed, shards_k=10):
     """Sample across shards that finished filter+annotation; join by clip_id."""
     rng = random.Random(seed)
-    ann_shards = {os.path.basename(p).split(".")[0] for p in fs.ls(ad["ann"])
-                  if p.endswith(".annotations.jsonl")}
+    ann_all = None
+    if ad.get("ann_file"):
+        ann_all = {r["clip_id"]: r for r in _read_jsonl_gcs(ad["ann_file"])}
+        ann_shards = None
+    else:
+        ann_shards = {os.path.basename(p).split(".")[0] for p in fs.ls(ad["ann"])
+                      if p.endswith(".annotations.jsonl")}
     filt_shards = sorted(os.path.basename(p).split(".")[0] for p in fs.ls(ad["filt"])
                          if p.endswith(".filtered.jsonl"))
-    ready = [s for s in filt_shards if s in ann_shards]
+    ready = filt_shards if ann_shards is None else [s for s in filt_shards if s in ann_shards]
     if not ready:
         raise RuntimeError(f"{ds}: no shards with both filter + annotations")
     picked = rng.sample(ready, min(shards_k, len(ready)))
@@ -171,7 +185,8 @@ def sample_ego(ds, ad, n, seed, shards_k=10):
     out = []
     for sh in picked:
         recs = _read_jsonl_gcs(f"{ad['filt']}/{sh}.filtered.jsonl")
-        anns = {r["clip_id"]: r for r in _read_jsonl_gcs(f"{ad['ann']}/{sh}.annotations.jsonl")}
+        anns = ann_all if ann_all is not None else \
+            {r["clip_id"]: r for r in _read_jsonl_gcs(f"{ad['ann']}/{sh}.annotations.jsonl")}
         joined = [r for r in recs if r["clip_id"] in anns]
         for r in rng.sample(joined, min(per, len(joined))):
             sfx = re.search(r"(\d{5})", r["descriptor"]["root_dir"]).group(1)
