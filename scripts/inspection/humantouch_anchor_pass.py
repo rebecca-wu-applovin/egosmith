@@ -84,7 +84,8 @@ def tracker_pts(row, side, joints=None):
 
 
 def blocks():
-    return {b['block_id']: b for b in json.load(open(CENSUS / 'blocks.json'))}
+    d = json.load(open(CENSUS / 'blocks2.json'))
+    return {b['block_id']: b for b in d['blocks']}
 
 
 def block_seed(block):
@@ -147,7 +148,7 @@ def pick_frames(df, M, t, K, dist, n=4, min_wrist_sep=250.0):
 def cmd_prep(args):
     bl = blocks()[args.block]
     task = bl['task']
-    ep_key = args.ep or bl.get('anchor_ep') or bl['ep_mid']
+    ep_key = args.ep or bl['anchor_ep']
     M, t = block_seed(bl)
     K, dist = load_calib_full(bl['dev'])
     mp4, pq = stage_episode(task, ep_key)
@@ -204,24 +205,25 @@ def cmd_prep(args):
     print(json.dumps(meta, indent=1))
 
 
-def solve_block(task, ep_key, dev, points, M0, t0):
+def solve_block(task, ep_key, dev, points, M0, t0, rot_only=False):
     df = pd.read_parquet(WORK / 'samples' / f'{task}_{ep_key}.parquet')
     K, dist = load_calib_full(dev)
     obs = [(tracker_pts(df.iloc[fi], side, [j])[0], np.array([u, v], float))
            for fi, side, j, u, v in points]
+    ndof = 3 if rot_only else 6
 
     def resid(x):
         M = Rt.from_rotvec(x[:3]).as_matrix() @ M0
-        t = t0 + x[3:]
+        t = t0 if rot_only else t0 + x[3:]
         r = []
         for ph, uv in obs:
             px, ok = project_px((ph @ M.T + t).reshape(1, 3), K, dist)
             r += list(px[0] - uv if ok[0] else [999.0, 999.0])
         return np.array(r)
 
-    sol = least_squares(resid, np.zeros(6), method='lm', max_nfev=8000)
+    sol = least_squares(resid, np.zeros(ndof), method='lm', max_nfev=8000)
     M = Rt.from_rotvec(sol.x[:3]).as_matrix() @ M0
-    t = t0 + sol.x[3:]
+    t = t0 if rot_only else t0 + sol.x[3:]
     e = np.linalg.norm(resid(sol.x).reshape(-1, 2), axis=1)
     return M, t, e
 
@@ -231,9 +233,10 @@ def cmd_solve(args):
     ann = json.load(open(WORK / 'ann' / f'{args.block}.json'))
     task, ep_key = ann['task'], ann['ep']
     M0, t0 = block_seed(bl)
-    M, t, e = solve_block(task, ep_key, bl['dev'], ann['points'], M0, t0)
+    M, t, e = solve_block(task, ep_key, bl['dev'], ann['points'], M0, t0,
+                          rot_only=args.rot_only)
     out = dict(block=args.block, task=task, ep=ep_key, dev=bl['dev'],
-               M=M.tolist(), t=t.tolist(),
+               M=M.tolist(), t=t.tolist(), rot_only=bool(args.rot_only),
                fit_median_px=float(np.median(e)), fit_max_px=float(e.max()),
                n_points=len(ann['points']),
                t_norm_m=float(np.linalg.norm(t)))
@@ -292,6 +295,7 @@ def main():
     p.add_argument('--zoom', type=float, default=2.0)
     p = sub.add_parser('solve')
     p.add_argument('--block', required=True)
+    p.add_argument('--rot-only', action='store_true', dest='rot_only')
     p = sub.add_parser('render')
     p.add_argument('--block', required=True)
     p.add_argument('--task', default=None)
