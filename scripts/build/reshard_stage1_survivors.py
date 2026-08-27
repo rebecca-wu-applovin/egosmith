@@ -42,6 +42,10 @@ def main() -> None:
                     help="also break shards when accumulated source bytes exceed this")
     ap.add_argument("--id_mode", choices=["basename", "group_basename", "session"], default="basename")
     ap.add_argument("--tar_index", default="", help="JSONL uri->offset/size/session (HoloAssist)")
+    ap.add_argument("--exclude_ids", default="",
+                    help="JSON list of episode ids (basename sans extension/_video) to drop "
+                         "before packing — e.g. mecka freeform ids shipping natively via "
+                         "flagship GT (dedup by construction)")
     ap.add_argument("--out_prefix", default="", help="override gs output prefix (default per-dataset)")
     ap.add_argument("--dry_run", action="store_true")
     args = ap.parse_args()
@@ -58,6 +62,19 @@ def main() -> None:
                     rows.append(json.loads(ln))
     print(f"[{ds}] {len(rows)} survivor videos, "
           f"{sum(r['kept_sec'] for r in rows) / 3600:.2f} kept-h")
+
+    if args.exclude_ids:
+        excl = set(json.load(open(args.exclude_ids)))
+        def _eid(uri: str) -> str:
+            b = uri.rsplit("/", 1)[-1]
+            for sfx in ("_video.mp4", ".mp4"):
+                if b.endswith(sfx):
+                    return b[: -len(sfx)]
+            return b
+        before_n, before_h = len(rows), sum(r["kept_sec"] for r in rows) / 3600
+        rows = [r for r in rows if _eid(r["uri"]) not in excl]
+        print(f"[{ds}] exclude_ids: {before_n} -> {len(rows)} videos, "
+              f"{before_h:.2f} -> {sum(r['kept_sec'] for r in rows) / 3600:.2f} kept-h")
 
     # join tar-member fetch info (offset/size/session)
     if args.tar_index:
@@ -88,10 +105,21 @@ def main() -> None:
         seen[b] = r["uri"]
 
     # source object sizes (bytes-cap packing + fleet ephemeral sizing).
-    # Plain objects: per-directory listings are cached by gcsfs, so this is cheap.
+    # Bulk-list each parent directory once (per-object fs.info was ~30 rows/s on
+    # the 62K-video mecka dir) and fall back to fs.info only for cache misses.
+    size_map: dict[str, int] = {}
+    parents = sorted({r["uri"][5:].rsplit("/", 1)[0] for r in rows if "size" not in r})
+    for d in parents:
+        try:
+            for e in fs.ls(d, detail=True):
+                size_map[e["name"]] = int(e.get("size") or 0)
+        except Exception:  # noqa: BLE001
+            pass
     for r in rows:
         if "size" in r:
             r["_bytes"] = int(r["size"])
+        elif r["uri"][5:] in size_map:
+            r["_bytes"] = size_map[r["uri"][5:]]
         else:
             try:
                 r["_bytes"] = int(fs.info(r["uri"][5:])["size"])

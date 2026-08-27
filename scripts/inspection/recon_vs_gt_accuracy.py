@@ -204,6 +204,89 @@ def eval_egodex_clip(recon_seq, tar_path, clip_id, mano_l, mano_r, dev):
     return out
 
 
+# ---------- mecka-flagship branch (recon MANO vs in-zarr GT keypoints) ----------
+# GT = EgoVerse zarr-v3 left/right.obs_keypoints (21x3 world) + obs_head_pose (c2w,
+# convention A from the 2026-08-27 kpt audit). Recon clips are conveyor sub-clips
+# (_ivNN) whose descriptor.extra carries interval_sec + source_fps/recon_fps, so
+# recon frame j maps to source frame round(start_sec*src_fps) + round(j*src_fps/recon_fps).
+def _load_mecka_gt(fs, zarr_root: str, ep_id: str):
+    sys.path.insert(0, str(_REPO / "scripts/inspection"))
+    from egoverse_kpt_audit import ZArr, pose7_to_T  # noqa: E402
+    base = f"{zarr_root}/{ep_id}.zarr"
+    kl = ZArr(fs, f"{base}/left.obs_keypoints").read_all().reshape(-1, 21, 3)
+    kr = ZArr(fs, f"{base}/right.obs_keypoints").read_all().reshape(-1, 21, 3)
+    head = ZArr(fs, f"{base}/obs_head_pose").read_all()
+    T = min(len(kl), len(kr), len(head))
+    c2w = np.stack([pose7_to_T(head[t]) for t in range(T)])
+    Rwc = np.transpose(c2w[:, :3, :3], (0, 2, 1))          # inv rotation
+    twc = -np.einsum("tij,tj->ti", Rwc, c2w[:, :3, 3])
+    return kl[:T], kr[:T], Rwc, twc
+
+
+def eval_mecka_clip(recon_seq, gt, extra, mano_l, mano_r, dev):
+    kl, kr, Rwc_g, twc_g = gt
+    Lr, Rr = _world_joints(recon_seq, mano_l, mano_r, dev)
+    cr = _cam(recon_seq)
+    if cr is None:
+        return {"status": "no_recon_camera"}
+    Rwc_r, twc_r, Cr = cr
+    if not (np.isfinite(Lr).all() and np.isfinite(Rr).all()
+            and np.isfinite(Cr).all() and np.isfinite(Rwc_r).all()):
+        return {"status": "degenerate_recon"}
+    src_fps = float(extra.get("source_fps") or 30.0)
+    rec_fps = float(extra.get("recon_fps") or 15.0)
+    start = int(round(float(extra["interval_sec"][0]) * src_fps))
+    step = src_fps / rec_fps
+    T = min(len(Lr), len(Cr))
+    src_idx = np.array([start + int(round(j * step)) for j in range(T)])
+    keep = src_idx < len(kl)
+    if keep.sum() < 2:
+        return {"status": "too_few_frames"}
+    src_idx = src_idx[keep]
+    Lr, Rr, Cr = Lr[: len(src_idx)], Rr[: len(src_idx)], Cr[: len(src_idx)]
+    Rwc_r, twc_r = Rwc_r[: len(src_idx)], twc_r[: len(src_idx)]
+    Lg, Rg = kl[src_idx], kr[src_idx]
+    Rwc_gc, twc_gc = Rwc_g[src_idx], twc_g[src_idx]
+    # GT camera centres (for ATE): C = -R^T t
+    Cg = -np.einsum("tji,tj->ti", Rwc_gc, twc_gc)
+    # GT presence mask: all-zero rows = untracked
+    val = (np.abs(Lg).sum((1, 2)) > 1e-8) & (np.abs(Rg).sum((1, 2)) > 1e-8)
+    if val.sum() < 2:
+        return {"status": "no_gt_camera"}
+    Lr, Rr, Lg, Rg = Lr[val], Rr[val], Lg[val], Rg[val]
+    Cr2, Cg2 = Cr[val], Cg[val]
+    Rwc_r2, twc_r2 = Rwc_r[val], twc_r[val]
+    Rwc_g2, twc_g2 = Rwc_gc[val], twc_gc[val]
+    T = int(val.sum())
+
+    sc, Rm, tm = umeyama(Cr2, Cg2)
+    ate = np.sqrt(((sc * (Rm @ Cr2.T).T + tm - Cg2) ** 2).sum(1)).mean()
+
+    src = np.concatenate([Lr.reshape(-1, 3), Rr.reshape(-1, 3)], 0)
+    dst = np.concatenate([Lg.reshape(-1, 3), Rg.reshape(-1, 3)], 0)
+    try:
+        ps, pR, pt = umeyama(src, dst)
+    except np.linalg.LinAlgError:
+        return {"status": "degenerate_recon"}
+
+    def pa(J):
+        return (ps * (pR @ J.reshape(-1, 3).T).T + pt).reshape(J.shape)
+
+    def tocam(J, Rwc, twc):
+        return np.einsum("tij,tnj->tni", Rwc, J) + twc[:, None, :]
+
+    out = {"status": "ok", "frames": T, "camera_ate_mm": float(ate * 1000),
+           "pa_scale": float(ps)}
+    for nm, Jr, Jg in [("left", Lr, Lg), ("right", Rr, Rg)]:
+        out[f"{nm}_pa_mpjpe_mm"] = float(np.sqrt(((pa(Jr) - Jg) ** 2).sum(-1)).mean() * 1000)
+        rc = tocam(Jr, Rwc_r2, twc_r2)
+        gc = tocam(Jg, Rwc_g2, twc_g2)
+        out[f"{nm}_camframe_mpjpe_mm"] = float(np.sqrt(((rc - gc) ** 2).sum(-1)).mean() * 1000)
+        out[f"{nm}_artic_mm"] = float(
+            np.sqrt((((rc - rc[:, :1]) - (gc - gc[:, :1])) ** 2).sum(-1)).mean() * 1000)
+    return out
+
+
 def _summ(vals):
     vals = [v for v in vals if v is not None and np.isfinite(v)]
     if not vals:
@@ -221,10 +304,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True,
                     choices=["taco", "oakink_grasp", "oakink_v2", "hot3d", "egodex",
-                             "dexycb", "ho3d", "show3d", "hoi4d"])
+                             "dexycb", "ho3d", "show3d", "hoi4d", "mecka_flagship"])
     ap.add_argument("--recon_root", required=True, help="dir of <clip>/ recon seq_folders")
     ap.add_argument("--gt_root", help="MANO datasets: dir of <clip>/ GT seq_folders")
     ap.add_argument("--egodex_frames_root", help="egodex: dir of <clip>.tar WDS frame tars")
+    ap.add_argument("--phaseb_manifest", help="mecka_flagship: conveyor manifest.jsonl (interval extra)")
+    ap.add_argument("--zarr_root",
+                    default="foundational-research/hoi-dataset/EgoVerse/processed_v3/mecka/flagship",
+                    help="mecka_flagship: GCS prefix of <ep>.zarr episodes (no gs://)")
     ap.add_argument("--out_csv", required=True)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -233,6 +320,15 @@ def main() -> None:
     mano_r, mano_l = build_mano_models(dev)
 
     clips = sorted(p.name for p in Path(args.recon_root).iterdir() if p.is_dir())
+    mk_extra, mk_gt_cache, mk_fs = {}, {}, None
+    if args.dataset == "mecka_flagship":
+        import json as _json
+        import gcsfs
+        mk_fs = gcsfs.GCSFileSystem()
+        for ln in open(args.phaseb_manifest):
+            if ln.strip():
+                r = _json.loads(ln)
+                mk_extra[r["clip_id"]] = r["descriptor"]["extra"]
     rows = []
     for clip in clips:
         recon_seq = str(Path(args.recon_root) / clip)
@@ -240,6 +336,15 @@ def main() -> None:
             if args.dataset == "egodex":
                 tar = str(Path(args.egodex_frames_root) / f"{clip}.tar")
                 m = eval_egodex_clip(recon_seq, tar, clip, mano_l, mano_r, dev)
+            elif args.dataset == "mecka_flagship":
+                if clip not in mk_extra:
+                    m = {"status": "error", "detail": "clip not in phaseb manifest"}
+                else:
+                    ep_id = clip.split("_video_iv")[0]
+                    if ep_id not in mk_gt_cache:
+                        mk_gt_cache[ep_id] = _load_mecka_gt(mk_fs, args.zarr_root, ep_id)
+                    m = eval_mecka_clip(recon_seq, mk_gt_cache[ep_id], mk_extra[clip],
+                                        mano_l, mano_r, dev)
             else:
                 m = eval_mano_clip(recon_seq, str(Path(args.gt_root) / clip), mano_l, mano_r, dev)
         except Exception as e:  # noqa: BLE001 — unexpected: a real harness/GT problem, not attrition
@@ -281,6 +386,9 @@ def main() -> None:
         print("  camera_ate_mm            :", _summ([r.get("camera_ate_mm") for r in ok]))
     for nm in ("left", "right"):
         print(f"  {nm}_pa_mpjpe_mm (PA, gauge-free):", _summ([r.get(f"{nm}_pa_mpjpe_mm") for r in ok]))
+    if any(f"{nm}_camframe_mpjpe_mm" in r for r in ok for nm in ("left", "right")):
+        for nm in ("left", "right"):
+            print(f"  {nm}_camframe_mpjpe_mm    :", _summ([r.get(f"{nm}_camframe_mpjpe_mm") for r in ok]))
     print("  pa_scale                 :", _summ([r.get("pa_scale") for r in ok]))
     for nm in ("left", "right"):
         print(f"  {nm}_artic_mm             :", _summ([r.get(f"{nm}_artic_mm") for r in ok]))
