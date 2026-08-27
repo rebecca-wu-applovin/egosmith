@@ -778,12 +778,22 @@ class OpenTouchHdf5Extractor:
         )
 
 
+def _wiyh_native_factory(**kw):
+    """Lazy import: the WIYH extractor pulls streaming deps (gcsfs/h5py) on use only."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from wiyh_native_extractor import WiyhNativeExtractor
+    return WiyhNativeExtractor(**kw)
+
+
 EXTRACTORS = {
     "hawor_npz": HaworNpzExtractor,
     "egoverse_zarr3": EgoverseZarr3Extractor,
     "assemblyhands_coco": AssemblyHandsExtractor,
     "dexcap_hdf5": DexcapHdf5Extractor,
     "opentouch_hdf5": OpenTouchHdf5Extractor,
+    "wiyh_native": _wiyh_native_factory,
 }
 
 
@@ -917,11 +927,16 @@ def _slice_ep(ep: dict, s: int, e: int) -> dict:
     out = dict(ep)
     for k in ("lw_t", "rw_t", "lw_R", "rw_R", "ltips", "rtips", "valid_l", "valid_r", "w2c"):
         out[k] = ep[k][s:e]
+    if ep.get("frame_meta") is not None:
+        out["frame_meta"] = ep["frame_meta"][s:e]
     return out
 
 
-def _write_clip_tar(sub_id, jpgs, lowdim, presence, frames_root, outputs_root):
-    """Write one sub-clip tar (template layout) and return sorted (frame_names, offsets)."""
+def _write_clip_tar(sub_id, jpgs, lowdim, presence, frames_root, outputs_root, frame_meta=None):
+    """Write one sub-clip tar (template layout) and return sorted (frame_names, offsets).
+
+    frame_meta: optional per-frame dicts merged into each .meta.json next to "presence"
+    (e.g. WIYH per-frame wrist-gate pixel codes)."""
     tar_path = Path(frames_root) / f"{sub_id}.tar"
     (Path(outputs_root) / sub_id).mkdir(parents=True, exist_ok=True)
     mano = np.zeros((2, 55), np.float32)
@@ -933,7 +948,10 @@ def _write_clip_tar(sub_id, jpgs, lowdim, presence, frames_root, outputs_root):
             for suffix, arr in ((".lowdim.npy", lowdim[t]), (".mano.npy", mano)):
                 buf = io.BytesIO(); np.save(buf, arr)
                 members.append((f"{key}{suffix}", buf.getvalue()))
-            members.append((f"{key}.meta.json", json.dumps({"presence": int(presence[t])}).encode()))
+            meta = {"presence": int(presence[t])}
+            if frame_meta is not None:
+                meta.update(frame_meta[t])
+            members.append((f"{key}.meta.json", json.dumps(meta).encode()))
             for name, payload in members:
                 ti = tarfile.TarInfo(name); ti.size = len(payload)
                 tw.addfile(ti, io.BytesIO(payload))
@@ -1003,7 +1021,8 @@ def convert_episode(episode_ref: str, spec: dict, args) -> list[dict]:
                 sub_ep, e - s, image_size=image_size,
                 presence_requires_projection=bool(spec.get("presence_requires_projection", False)))
             fn, fo = _write_clip_tar(sub_id, jpgs[s:e], lowdim, presence,
-                                     args.frames_root, args.outputs_root)
+                                     args.frames_root, args.outputs_root,
+                                     frame_meta=sub_ep.get("frame_meta"))
             r = {"episode": episode_ref, "status": "ok", "clip_id": sub_id,
                  "frames": e - s, "task": ep.get("task", ""), "desc": ep.get("desc", ""),
                  "fps": fps, "presence_ratio": float((presence > 0).mean()),
