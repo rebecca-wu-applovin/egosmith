@@ -1,0 +1,25 @@
+# EgoVerse mecka/flagship — zarr-v3 episodes with in-zarr 21-kpt GT + images.front_1
+# (640x360 JPEG; the sibling mp4 is a 320x180 downscale and is NOT used here — the
+# in-zarr intrinsics match the 640x360 images). GT-coverage census 2026-08-27:
+# 19,022/35,726 episodes GT-bearing (>=90% frame coverage both hands); the rest carry
+# truncated arrays and are rejected by min_kpt_coverage (native = GT-derived only).
+# Kpt audit: convention A verified, overlays lock on (EGOVERSE_KPT_AUDITS_2026-08-27).
+dataset: egoverse_mecka_flagship
+source_id: egoverse_mecka_flagship
+split: train
+fps: 30
+lowdim_schema: egoverse_keypoints_world_v1
+extractor: egoverse_zarr3
+presence_requires_projection: true
+glitch_jump_thresh_m: 0.05
+glitch_rot_spike_frob: 0.99
+extractor_args:
+  gcs_prefix: gs://foundational-research/hoi-dataset/EgoVerse/processed_v3
+  sources: [mecka/flagship]
+  quat_order: wxyz
+  camera: front_1
+  keypoint_tip_indices: [4, 8, 12, 16, 20]
+  pose_frame: world
+  frames_source: zarr_images
+  min_kpt_coverage: 0.9
+  read_annotations: true

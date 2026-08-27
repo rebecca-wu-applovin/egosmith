@@ -198,13 +198,18 @@ def read_zarr3_array(array_dir: Path) -> np.ndarray:
     sep = meta["chunk_key_encoding"]["configuration"].get("separator", "/")
     fill = meta.get("fill_value", 0)
     codecs = meta["codecs"]
-    assert len(codecs) == 1 and codecs[0]["name"] == "sharding_indexed", f"unsupported codecs {codecs}"
-    cfg = codecs[0]["configuration"]
-    inner = tuple(cfg["chunk_shape"])
-    inner_codecs = [c["name"] for c in cfg["codecs"]]
+    if codecs[0]["name"] == "sharding_indexed":
+        cfg = codecs[0]["configuration"]
+        inner = tuple(cfg["chunk_shape"])
+        inner_codecs = [c["name"] for c in cfg["codecs"]]
+    else:
+        # plain (unsharded) chunks: codecs apply directly, grid chunk == inner chunk
+        cfg = None
+        inner = outer
+        inner_codecs = [c["name"] for c in codecs]
     assert inner_codecs[0] == "bytes", f"unsupported inner codecs {inner_codecs}"
     use_zstd = "zstd" in inner_codecs
-    assert cfg.get("index_location", "end") == "end"
+    assert cfg is None or cfg.get("index_location", "end") == "end"
     if use_zstd:
         from numcodecs import Zstd
         zstd = Zstd()
@@ -219,10 +224,14 @@ def read_zarr3_array(array_dir: Path) -> np.ndarray:
         if not chunk_path.is_file():
             continue
         blob = chunk_path.read_bytes()
-        index_size = n_inner_total * 16 + 4  # (offset,u64)+(nbytes,u64) per inner chunk + crc32c
-        index = blob[-index_size:-4]
+        if cfg is None:
+            spans = [(0, len(blob))]  # whole chunk = one inner chunk
+        else:
+            index_size = n_inner_total * 16 + 4  # (offset,u64)+(nbytes,u64) per inner + crc32c
+            index = blob[-index_size:-4]
+            spans = [struct.unpack_from("<QQ", index, f * 16) for f in range(n_inner_total)]
         for flat, inner_idx in enumerate(np.ndindex(*n_inner_per_outer)):
-            off, nb = struct.unpack_from("<QQ", index, flat * 16)
+            off, nb = spans[flat]
             if off == 0xFFFFFFFFFFFFFFFF:
                 continue
             raw = blob[off: off + nb]
@@ -235,6 +244,65 @@ def read_zarr3_array(array_dir: Path) -> np.ndarray:
                 stop = min(s + i_sz, dim)
                 sl.append(slice(s, stop)); asl.append(slice(0, stop - s))
             out[tuple(sl)] = arr[tuple(asl)]
+    return out
+
+
+def read_zarr3_vlen_bytes(array_dir: Path) -> list:
+    """Local reader for 1-D variable_length_bytes zarr-v3 arrays (JPEG frames /
+    annotation JSON). Returns list of bytes (None where the inner chunk is absent).
+    Same shard layout as read_zarr3_array but payloads are vlen (u32 count header
+    per shard concat is NOT used here — each inner chunk decompresses to one
+    4-byte-length-prefixed record stream for annotations, or raw JPEG for images;
+    callers split as needed). We return the decompressed inner chunk bytes."""
+    import zstandard as zstd
+    meta = json.loads((array_dir / "zarr.json").read_text())
+    assert meta["zarr_format"] == 3 and meta["data_type"] == "variable_length_bytes"
+    shape = tuple(meta["shape"])
+    outer = tuple(meta["chunk_grid"]["configuration"]["chunk_shape"])
+    sharded = meta["codecs"][0]["name"] == "sharding_indexed"
+    inner = tuple(meta["codecs"][0]["configuration"]["chunk_shape"]) if sharded else outer
+    dec = zstd.ZstdDecompressor()
+    n_outer = int(np.ceil(shape[0] / outer[0]))
+    n_inner_per_outer = int(np.ceil(outer[0] / inner[0]))
+    out: list = [None] * shape[0]
+    for k in range(n_outer):
+        chunk_path = array_dir / "c" / str(k)
+        if not chunk_path.is_file():
+            continue
+        blob = chunk_path.read_bytes()
+        if sharded:
+            index_size = n_inner_per_outer * 16 + 4
+            index = blob[-index_size:-4]
+            spans = [struct.unpack_from("<QQ", index, j * 16) for j in range(n_inner_per_outer)]
+        else:
+            spans = [(0, len(blob))]
+        for j, (off, nb) in enumerate(spans):
+            if off == 0xFFFFFFFFFFFFFFFF or nb == 0:
+                continue
+            i = k * outer[0] + j * inner[0]
+            if i >= shape[0]:
+                break
+            out[i] = dec.decompress(blob[off: off + nb], max_output_size=100_000_000)
+    return out
+
+
+def parse_vlen_annotations(raw: bytes) -> list[dict]:
+    """EgoVerse `annotations` inner chunk: u32 record-count, then per record a u32
+    byte-length + JSON payload ({text,start_idx,end_idx})."""
+    if not raw or len(raw) < 4:
+        return []
+    n = struct.unpack_from("<I", raw, 0)[0]
+    pos, out = 4, []
+    for _ in range(n):
+        if pos + 4 > len(raw):
+            break
+        ln = struct.unpack_from("<I", raw, pos)[0]
+        pos += 4
+        try:
+            out.append(json.loads(raw[pos: pos + ln]))
+        except Exception:  # noqa: BLE001
+            pass
+        pos += ln
     return out
 
 
@@ -319,13 +387,21 @@ class EgoverseZarr3Extractor:
     ``attributes.intrinsics[camera]``."""
 
     def __init__(self, gcs_prefix, sources=("aria",), quat_order="wxyz", camera="front_1",
-                 keypoint_tip_indices=(4, 8, 12, 16, 20), pose_frame="world"):
+                 keypoint_tip_indices=(4, 8, 12, 16, 20), pose_frame="world",
+                 frames_source="mp4", min_kpt_coverage=0.0, read_annotations=False):
         self.gcs_prefix = gcs_prefix.rstrip("/")
         self.sources = list(sources)
         self.quat_order = quat_order
         self.camera = camera
         self.tip_idx = list(keypoint_tip_indices)
         assert pose_frame == "world"
+        assert frames_source in ("mp4", "zarr_images")
+        self.frames_source = frames_source
+        # GT-coverage guard: mecka/flagship carries truncated obs_keypoints on ~47% of
+        # episodes (e.g. 37 rows vs 3,046 frames). Below this coverage the episode is
+        # rejected (native path is GT-derived; a mostly-empty GT episode is not).
+        self.min_kpt_coverage = float(min_kpt_coverage)
+        self.read_annotations = bool(read_annotations)
 
     def list_episodes(self, limit=None):
         eps = []
@@ -346,15 +422,29 @@ class EgoverseZarr3Extractor:
         gcs_download(f"{episode_url}/zarr.json", zdir / "zarr.json")
         arrays = ["left.obs_wrist_pose", "right.obs_wrist_pose", "left.obs_keypoints",
                   "right.obs_keypoints", "obs_head_pose"]
+        if self.frames_source == "zarr_images":
+            arrays.append(f"images.{self.camera}")
+        if self.read_annotations:
+            arrays.append("annotations")
         for a in arrays:
-            gcs_download(f"{episode_url}/{a}", zdir, recursive=True)
-        gcs_download(f"{episode_url.rsplit('/',1)[0]}/{stem}.mp4", work / "video.mp4")
+            try:
+                gcs_download(f"{episode_url}/{a}", zdir, recursive=True)
+            except Exception:
+                if a == "annotations":
+                    continue  # optional
+                raise
+        if self.frames_source == "mp4":
+            gcs_download(f"{episode_url.rsplit('/',1)[0]}/{stem}.mp4", work / "video.mp4")
 
         root = json.loads((zdir / "zarr.json").read_text())
         attrs = root["attributes"]
         fps = float(attrs.get("fps", 30))
-        K = np.array(attrs["intrinsics"][self.camera], np.float64)
-        intr = np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]], np.float32)
+        intr_raw = attrs.get("intrinsics", {}).get(self.camera) or attrs.get("camera_intrinsics")
+        if isinstance(intr_raw, dict):
+            intr = np.array([intr_raw["fx"], intr_raw["fy"], intr_raw["cx"], intr_raw["cy"]], np.float32)
+        else:
+            K = np.array(intr_raw, np.float64)
+            intr = np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]], np.float32)
 
         def arr(name):
             return read_zarr3_array(zdir / name)
@@ -363,6 +453,11 @@ class EgoverseZarr3Extractor:
         lk = arr("left.obs_keypoints").reshape(-1, 21, 3)
         rk = arr("right.obs_keypoints").reshape(-1, 21, 3)
         head = arr("obs_head_pose")
+        if self.min_kpt_coverage > 0:
+            total = int(attrs.get("total_frames") or head.shape[0])
+            cov = min(len(lk), len(rk)) / max(1, total)
+            if cov < self.min_kpt_coverage:
+                raise ValueError(f"gt_truncated: kpt coverage {cov:.2f} < {self.min_kpt_coverage}")
         T = min(len(lw), len(rw), len(lk), len(rk), len(head))
         lw, rw, lk, rk, head = lw[:T], rw[:T], lk[:T], rk[:T], head[:T]
 
@@ -374,6 +469,50 @@ class EgoverseZarr3Extractor:
         # validity: all-zero rows mean no track
         valid_l = np.abs(lk).sum(axis=(1, 2)) > 1e-8
         valid_r = np.abs(rk).sum(axis=(1, 2)) > 1e-8
+        if self.frames_source == "zarr_images":
+            raw = read_zarr3_vlen_bytes(zdir / f"images.{self.camera}")
+            jpegs = []
+            for r in raw[:T]:
+                if r is None:
+                    jpegs.append(None)
+                    continue
+                recs = None
+                if len(r) >= 8:
+                    try:
+                        n0, l0 = struct.unpack_from("<II", r, 0)
+                        if n0 == 1 and 8 + l0 <= len(r):
+                            recs = r[8: 8 + l0]
+                    except struct.error:
+                        pass
+                if recs is None:  # fall back: scan for JPEG SOI
+                    j = r.find(b"\xff\xd8\xff")
+                    recs = r[j:] if j >= 0 else None
+                jpegs.append(recs)
+            # drop trailing missing frames; interior gaps replicate previous frame
+            last_ok = max((i for i, b in enumerate(jpegs) if b), default=-1)
+            jpegs = jpegs[: last_ok + 1]
+            for i in range(len(jpegs)):
+                if jpegs[i] is None:
+                    jpegs[i] = jpegs[i - 1] if i else b""
+            frames = dict(mode="jpeg_list", jpegs=jpegs)
+        else:
+            frames = dict(mode="mp4", path=str(work / "video.mp4"))
+        task = attrs.get("task") or attrs.get("task_name") or src
+        desc = attrs.get("task_description", "")
+        extra = {}
+        if self.read_annotations and (zdir / "annotations").is_dir():
+            try:
+                ann_raw = read_zarr3_vlen_bytes(zdir / "annotations")
+                anns = []
+                for chunk in ann_raw:
+                    if chunk:
+                        anns.extend(parse_vlen_annotations(chunk))
+                if anns:
+                    extra["annotations"] = anns
+                    if not attrs.get("task"):
+                        task = anns[0].get("text") or task
+            except Exception:  # noqa: BLE001 — annotations are best-effort
+                pass
         return dict(
             lw_t=lw[:, :3], rw_t=rw[:, :3],
             lw_R=_quat_to_rotmat(lw[:, 3:7], self.quat_order),
@@ -381,9 +520,95 @@ class EgoverseZarr3Extractor:
             ltips=lk[:, self.tip_idx], rtips=rk[:, self.tip_idx],
             valid_l=valid_l, valid_r=valid_r,
             w2c=w2c, intr=intr, fps=fps,
+            frames=frames, extra=extra,
+            task=task, desc=desc,
+            episode_name=f"{src.replace('/', '_')}_{stem}",
+        )
+
+
+class LightwheelPoseJsonExtractor:
+    """EgoVerse lightwheel: per-episode dir ``<uuid>/`` with ``pose.json`` (per-frame
+    body/head/left_hand/right_hand — hands are 21 joints of {quat(wxyz keys), x,y,z},
+    world frame, meters), ``head_left_camera/head_left_camera_params.json`` (per-frame
+    R_w2c/t_w2c aligned 1:1 with video frames, 1-based 'frame' field, +
+    undistorted_intrinsics fx/fy/cx/cy) and
+    ``head_left_camera/head_left_camera_undistorted.mp4`` (1920x1456@30).
+    Frame alignment verified on 6/6 episodes in the 2026-08-27 kpt audit
+    (_audits/egoverse_lightwheel_kpt_audit_2026-08-27/)."""
+
+    def __init__(self, gcs_prefix, camera="head_left_camera",
+                 keypoint_tip_indices=(4, 8, 12, 16, 20)):
+        self.gcs_prefix = gcs_prefix.rstrip("/")
+        self.camera = camera
+        self.tip_idx = list(keypoint_tip_indices)
+
+    def list_episodes(self, limit=None):
+        eps = [u.rstrip("/") for u in gcs_list(f"{self.gcs_prefix}/")
+               if u.endswith("/") and not u.rstrip("/").rsplit("/", 1)[-1].endswith("h_0514")]
+        eps.sort()
+        return eps[:limit] if limit else eps
+
+    @staticmethod
+    def _hand_arrays(frames, key, tip_idx):
+        T = len(frames)
+        pos = np.zeros((T, 21, 3), np.float64)
+        quat = np.zeros((T, 4), np.float64)  # wrist quat, wxyz
+        valid = np.zeros(T, bool)
+        for t, fr in enumerate(frames):
+            joints = fr.get(key) or []
+            if len(joints) != 21:
+                continue
+            ok = True
+            for j, d in enumerate(joints):
+                try:
+                    pos[t, j] = (d["x"], d["y"], d["z"])
+                except (KeyError, TypeError):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            q = joints[0].get("quat") or {}
+            quat[t] = (q.get("w", 1.0), q.get("x", 0.0), q.get("y", 0.0), q.get("z", 0.0))
+            valid[t] = np.abs(pos[t]).sum() > 1e-8
+        return pos, quat, valid
+
+    def load(self, episode_url: str, work: Path) -> dict:
+        ep_id = episode_url.rstrip("/").rsplit("/", 1)[-1]
+        cam = self.camera
+        gcs_download(f"{episode_url}/pose.json", work / "pose.json")
+        gcs_download(f"{episode_url}/{cam}/{cam}_params.json", work / "params.json")
+        gcs_download(f"{episode_url}/{cam}/{cam}_undistorted.mp4", work / "video.mp4")
+        pose = json.loads((work / "pose.json").read_text())
+        prm = json.loads((work / "params.json").read_text())
+        ki = prm["undistorted_intrinsics"]
+        intr = np.array([ki["fx"], ki["fy"], ki["cx"], ki["cy"]], np.float32)
+        pf = pose["frames"]
+        cf = prm["frames"]
+        T = min(len(pf), len(cf))
+        w2c = np.tile(np.eye(4), (T, 1, 1))
+        for t in range(T):
+            w2c[t, :3, :3] = np.array(cf[t]["R_w2c"], np.float64)
+            w2c[t, :3, 3] = np.array(cf[t]["t_w2c"], np.float64)
+        lk, lq, valid_l = self._hand_arrays(pf[:T], "left_hand", self.tip_idx)
+        rk, rq, valid_r = self._hand_arrays(pf[:T], "right_hand", self.tip_idx)
+        task = ""
+        try:
+            gcs_download(f"{episode_url}/annotation.json", work / "annotation.json")
+            ann = json.loads((work / "annotation.json").read_text())
+            if isinstance(ann, dict):
+                task = ann.get("task") or ann.get("task_name") or ann.get("description") or ""
+            extra = {"annotation": ann} if ann else {}
+        except Exception:  # noqa: BLE001
+            extra = {}
+        return dict(
+            lw_t=lk[:, 0], rw_t=rk[:, 0],
+            lw_R=_quat_to_rotmat(lq, "wxyz"), rw_R=_quat_to_rotmat(rq, "wxyz"),
+            ltips=lk[:, self.tip_idx], rtips=rk[:, self.tip_idx],
+            valid_l=valid_l, valid_r=valid_r,
+            w2c=w2c, intr=intr, fps=30.0,
             frames=dict(mode="mp4", path=str(work / "video.mp4")),
-            task=attrs.get("task_name", src), desc=attrs.get("task_description", ""),
-            episode_name=f"{src}_{stem}",
+            task=task, desc="", extra=extra,
+            episode_name=ep_id,
         )
 
 
@@ -790,6 +1015,7 @@ def _wiyh_native_factory(**kw):
 EXTRACTORS = {
     "hawor_npz": HaworNpzExtractor,
     "egoverse_zarr3": EgoverseZarr3Extractor,
+    "lightwheel_posejson": LightwheelPoseJsonExtractor,
     "assemblyhands_coco": AssemblyHandsExtractor,
     "dexcap_hdf5": DexcapHdf5Extractor,
     "opentouch_hdf5": OpenTouchHdf5Extractor,
@@ -1006,13 +1232,34 @@ def convert_episode(episode_ref: str, spec: dict, args) -> list[dict]:
                     ep[tk][:T], ep[Rk][:T], ep[tipk][:T], ep[vk][:T],
                     spec.get("glitch_jump_thresh_m"), spec.get("glitch_rot_spike_frob"))
         fps = float(ep.get("fps") or spec.get("fps") or 30.0)
-        if segmented:
-            seg_len = max(3, int(round(float(args.segment_sec) * fps)))
-            min_len = max(3, int(round(float(args.min_segment_sec) * fps)))
+        seg_len = max(3, int(round(float(args.segment_sec or 0) * fps))) if segmented else T
+        min_len = max(3, int(round(float(args.min_segment_sec) * fps)))
+        ivs = None
+        if getattr(args, "_intervals", None) is not None:
+            for key in (ep.get("episode_name", ""), episode_ref.rstrip("/").rsplit("/", 1)[-1],
+                        Path(episode_ref.rstrip("/")).stem):
+                if key in args._intervals:
+                    ivs = args._intervals[key]
+                    break
+            if ivs is None:
+                return [{**result, "status": "skipped", "error": "no stage1 intervals"}]
+        if ivs is not None:
+            # Stage-1 kept intervals as the segment gate: convert only kept frame spans,
+            # splitting each span by --segment_sec. Sub-clips keep the _segNN naming.
+            bounds = []
+            for s0, e0 in ivs:
+                s0, e0 = max(0, int(s0)), min(T, int(e0))
+                step = seg_len if segmented else (e0 - s0)
+                for s in range(s0, e0, max(3, step)):
+                    e = min(s + step, e0)
+                    if (e - s) >= min_len:
+                        bounds.append((s, e))
+        elif segmented:
             bounds = [(s, min(s + seg_len, T)) for s in range(0, T, seg_len)]
             bounds = [(s, e) for s, e in bounds if (e - s) >= min_len]
         else:
             bounds = [(0, T)]
+        segmented = segmented or ivs is not None
         results = []
         for k, (s, e) in enumerate(bounds):
             sub_id = f"{clip_id}_seg{k:02d}" if segmented else clip_id
@@ -1119,6 +1366,11 @@ def build_parser():
     p.add_argument("--episodes", default=None, help="comma-separated explicit episode refs (overrides listing)")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--split", default="train")
+    p.add_argument("--intervals_json", default=None,
+                   help="JSON {episode_key: [[start_frame,end_frame],...]} — convert only these "
+                        "source-frame spans (Stage-1 kept intervals as segment gate). Episodes "
+                        "absent from the map are skipped. Keys match episode_name or the episode "
+                        "ref basename/stem.")
     p.add_argument("--segment_sec", type=float, default=0.0,
                    help=">0: split each session into consecutive N-second sub-clips (_segNN tars)")
     p.add_argument("--min_segment_sec", type=float, default=2.0,
@@ -1129,6 +1381,10 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     spec = load_spec(args.spec)
+    args._intervals = None
+    if args.intervals_json:
+        args._intervals = json.loads(Path(args.intervals_json).read_text())
+        print(f"[intervals] {len(args._intervals)} episodes gated by stage-1 intervals", flush=True)
     for d in (args.frames_root, args.outputs_root):
         Path(d).mkdir(parents=True, exist_ok=True)
     extractor = EXTRACTORS[spec["extractor"]](**spec.get("extractor_args", {}))

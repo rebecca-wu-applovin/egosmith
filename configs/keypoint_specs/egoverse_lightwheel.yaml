@@ -1,0 +1,19 @@
+# EgoVerse lightwheel — 10,916 episode dirs: pose.json 21-kpt world hands (+ wrist quat)
+# aligned 1:1 with head_left_camera_undistorted.mp4 (1920x1456@30) through per-frame
+# R_w2c/t_w2c + undistorted pinhole K (fx=fy=789.39, cx=960, cy=728).
+# Kpt audit PASS 6/6 incl articulation (_audits/egoverse_lightwheel_kpt_audit_2026-08-27/).
+# Stage-1 kept intervals (9,441 videos / 57.27 kept-h) applied via --intervals_json
+# as the segment gate (episode key = episode uuid).
+dataset: egoverse_lightwheel
+source_id: egoverse_lightwheel
+split: train
+fps: 30
+lowdim_schema: lightwheel_keypoints_world_v1
+extractor: lightwheel_posejson
+presence_requires_projection: true
+glitch_jump_thresh_m: 0.05
+glitch_rot_spike_frob: 0.99
+extractor_args:
+  gcs_prefix: gs://foundational-research/hoi-dataset/EgoVerse/processed_v3/lightwheel
+  camera: head_left_camera
+  keypoint_tip_indices: [4, 8, 12, 16, 20]
