@@ -38,12 +38,27 @@ egosmith_filtered/
 | oakink_actions | 2,488 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | egodex | 158,564 | native — GT read straight from the tar | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` + `.gt_joints.npy` |
 | h2o | 149 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
+| wiyh_native | see `filter_run/BUCKET_AUDIT.json` | native (TAGGED) — 25-joint glove GT via per-session anchor solve | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (with per-frame `gate_px`) |
 
 H2O (ETH, ICCV 2021; egocentric cam4 only, 30 fps, two-hands+object tabletop manipulation;
 built by `scripts/build/generate_h2o_world_res.py`, W9 2026-08-25): 184 sequences converted
 (1.06 h) → 149 kept (0.85 h) under the canonical GT filter (`--stages infiller --source_fps 30
 --target_fps 30 --min_presence_ratio 0.5`); drops are motion-step glitches. License: academic
 use only (see `hoi-dataset/H2O/PROVENANCE.md`).
+
+**WIYH native tier caveat (W7 locked-tier ingestion, 2026-08-28):** `wiyh_native` is a
+TAGGED approximate tier — every record carries `metadata.finger_quality =
+"approximate_35_65px"`. WIYH ships a real 25-joint glove skeleton (50 Hz) + per-frame wrist
+SE3, but NOT the glove→eef mounting extrinsic; that extrinsic is solved per session from
+vision (auto-anchor on the gloves' fingertip pads; fit 15–45 px, holdout <60 px). Wrist
+translation is sensor-locked (census median 0–2 px vs hand masks); finger articulation is
+approximate at the 35–65 px level — mask finger-level targets for pixel-tight work; wrist
+pose, video, and language annotations are reliable. Only wrist-LOCKED sessions ship (both
+hands ≥80% frames <30 px eef-to-hand-mask; 269/4,420 sessions locked, 43 anchored-and-
+accepted in v1 — the census + per-session anchor registry are additive, so later anchor
+passes can extend the tier without touching shipped clips). Per-frame wrist-gate pixel codes
+ship in every frame's `.meta.json`. `wiyh_native` EXTENDS the `wiyh` recon tier (757 clips,
+disjoint method — that tier stays as-is); see `egosmith_filtered/wiyh_native/filter_run/FILTER_MODE.txt`.
 
 **DexCap caveat (audit 2026-08-25):** every kept clip carries
 `metadata.finger_articulation_unreliable=true` (`severity: severe` for `packaging_*`,

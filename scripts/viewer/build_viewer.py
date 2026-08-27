@@ -120,6 +120,9 @@ ADAPTERS = {
     # native lowdim (Vision Pro GT); full 21-joint skeletons pulled per clip from the
     # raw EgoDex hdf5s (ranged zip reads, egodex_rawgt.py) — lowdim carries only 6 pts
     "egodex": dict(kind="native", fps=30.0, raw_gt="egodex"),
+    # WIYH native tier: 25-joint glove GT via per-session anchor solve; tagged
+    # finger_quality=approximate_35_65px (see egosmith_filtered/wiyh_native/FILTER_MODE.txt)
+    "wiyh_native": dict(kind="native", fps=10.0),
 }
 
 # Datasets dropped from the shipped set (tombstoned, data preserved on the bucket —
@@ -142,7 +145,8 @@ CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric
             "holoassist": "Cat-1 (recon)", "ego4d": "Cat-1 (recon)",
             "epic_kitchens_100": "Cat-1 (recon)", "egoverse_aria": "Cat-1 (recon)",
             "egotouch": "Cat-1 (seeded recon, gloved hands)",
-            "wiyh": "Cat-2 (recon, exoskeleton hands — 0.37% keep)"}
+            "wiyh": "Cat-2 (recon, exoskeleton hands — 0.37% keep)",
+            "wiyh_native": "Cat-2 native GT (25-joint glove, approx 35-65px fingers)"}
 
 
 def _read_jsonl_gcs(path):
