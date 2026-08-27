@@ -271,9 +271,13 @@ def run_sample(pre: dict, n: int, min_ratio: float, workers: int, seed: int) -> 
     shards = list_shards(pre)
     rng.shuffle(shards)
     rows = []
+    per_shard_cap = max(50, n // 10)  # spread the sample across shards
     for sfx in shards[:max(50, n // 40 + 1)]:
         raw = fs.cat(f"{pre['filt']}/shard_{sfx}.filtered.jsonl").decode()
-        rows += [(sfx, json.loads(l)) for l in raw.splitlines() if l.strip()]
+        shard_rows = [(sfx, json.loads(l)) for l in raw.splitlines() if l.strip()]
+        if len(shard_rows) > per_shard_cap:
+            shard_rows = rng.sample(shard_rows, per_shard_cap)
+        rows += shard_rows
         if len(rows) >= 20 * n:
             break
     sample = rng.sample(rows, min(n, len(rows)))
