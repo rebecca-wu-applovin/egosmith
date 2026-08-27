@@ -35,6 +35,7 @@ EP_LIST="${EP_LIST:?FATAL: EP_LIST unset}"
 EP_PREFIX="${EP_PREFIX:-}"
 INTERVALS="${INTERVALS:-}"
 RUN_STAGE1="${RUN_STAGE1:-0}"
+CLIP_CONFIG="${CLIP_CONFIG:-}"   # yaml filename under $FLEET for stage1_prefilter --config
 SEGMENT_SEC="${SEGMENT_SEC:-10}"
 SOURCE_FPS="${SOURCE_FPS:-30}"
 MIN_PRESENCE="${MIN_PRESENCE:-0.5}"
@@ -100,10 +101,15 @@ if [ "$ntar" -eq 0 ] && [ "$nfail" -gt 0 ]; then log "FATAL: 0 tars with $nfail 
 
 S4IN="$W/manifest.jsonl"
 if [ "$RUN_STAGE1" = "1" ] && [ "$ntar" -gt 0 ]; then
-  log "Stage-1 prefilter..."
+  CFGARG=""
+  if [ -n "$CLIP_CONFIG" ]; then
+    gcloud storage cp "$FLEET/$CLIP_CONFIG" "/tmp/$CLIP_CONFIG" || { log "FATAL: clip config pull failed"; exit 1; }
+    CFGARG="--config /tmp/$CLIP_CONFIG"
+  fi
+  log "Stage-1 prefilter... (config=${CLIP_CONFIG:-production})"
   python scripts/build/stage1_prefilter.py --input_manifest "$W/manifest.jsonl" \
     --output_manifest "$W/stage1.kept.jsonl" --report_out "$W/s1.json" \
-    --fps "$SOURCE_FPS" 2>&1 | tail -2
+    --fps "$SOURCE_FPS" $CFGARG 2>&1 | tail -2
   S4IN="$W/stage1.kept.jsonl"
 fi
 

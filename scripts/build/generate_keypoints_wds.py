@@ -1205,6 +1205,21 @@ def convert_episode(episode_ref: str, spec: dict, args) -> list[dict]:
     work = Path(tempfile.mkdtemp(prefix=f"{ds}_", dir=args.frames_root))
     try:
         ep = extractor.load(episode_ref, work)
+        if spec.get("recenter_world"):
+            # Re-gauge: translate the world origin to the first-frame camera centre.
+            # Physically a no-op (rigid translation of every world quantity), but the
+            # quality filter's camera_translation_step reads the w2c translation vector,
+            # which for a far world origin (|C|~43 m on egoverse/scale) swings by
+            # |dR| x |C| under pure head rotation — 22 cm/frame of fake camera motion.
+            R0, t0 = ep["w2c"][0, :3, :3], ep["w2c"][0, :3, 3]
+            C0 = -(R0.T @ t0)
+            for k in ("lw_t", "rw_t"):
+                ep[k] = ep[k] - C0
+            for k in ("ltips", "rtips"):
+                ep[k] = ep[k] - C0
+            w2c = ep["w2c"].copy()
+            w2c[:, :3, 3] = w2c[:, :3, 3] + np.einsum("tij,j->ti", w2c[:, :3, :3], C0)
+            ep["w2c"] = w2c
         clip_id = f"{ds}_{re.sub(r'[^A-Za-z0-9_.-]', '-', ep['episode_name'])}"
         result["clip_id"] = clip_id
         segmented = float(args.segment_sec or 0) > 0

@@ -22,3 +22,7 @@ extractor_args:
   frames_source: mp4
   min_kpt_coverage: 0.5
   read_annotations: true
+
+# Re-gauge world to first-frame camera centre (w2c-translation step artifact fix;
+# measured: scale world origin ~43 m from camera -> 22 cm/frame fake cam steps)
+recenter_world: true

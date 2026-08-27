@@ -17,3 +17,7 @@ extractor_args:
   gcs_prefix: gs://foundational-research/hoi-dataset/EgoVerse/processed_v3/lightwheel
   camera: head_left_camera
   keypoint_tip_indices: [4, 8, 12, 16, 20]
+
+# Re-gauge world to first-frame camera centre (w2c-translation step artifact fix;
+# measured: scale world origin ~43 m from camera -> 22 cm/frame fake cam steps)
+recenter_world: true

@@ -23,3 +23,7 @@ extractor_args:
   frames_source: zarr_images
   min_kpt_coverage: 0.9
   read_annotations: true
+
+# Re-gauge world to first-frame camera centre (w2c-translation step artifact fix;
+# measured: scale world origin ~43 m from camera -> 22 cm/frame fake cam steps)
+recenter_world: true
