@@ -188,6 +188,9 @@ def process_shard(sfx: str, workers: int):
          # trivially (1.2% leak measured on shipped 100K keeps) — require poses
          # present in at least half the frames.
          "--min_presence_ratio", "0.5",
+         # Stage-1 certified TWO visible hands for these datasets (min_hands=2);
+         # reconstruction must deliver both — drop single_valid_hand clips.
+         "--min_presence_ratio_per_hand", "0.5",
          "--max_wrist_rotation_step", GATE_WRIST,
          "--max_hand_translation_step", GATE_HAND,
          "--max_finger_translation_step", GATE_FINGER,

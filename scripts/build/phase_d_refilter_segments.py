@@ -181,6 +181,9 @@ def process_shard(sfx: str, workers: int, win: int, min_tail: int, keep_work: bo
              "--report_out", str(rep), "--stages", "infiller", "--workers", "16",
              "--source_fps", SOURCE_FPS, "--target_fps", "30",
              "--min_presence_ratio", "0.5",
+             # Stage-1 certified two hands; segment recovery must not reintroduce
+             # single-hand clips (same gate as phase_d_incremental).
+             "--min_presence_ratio_per_hand", "0.5",
              "--max_wrist_rotation_step", GATE_WRIST,
              "--max_hand_translation_step", GATE_HAND,
              "--max_finger_translation_step", GATE_FINGER,

@@ -34,6 +34,8 @@ def new_clip_quality_stats(
         "frames_total": 0,
         "frames_kept_candidate": 0,
         "presence_nonzero_frames": 0,
+        "presence_left_frames": 0,
+        "presence_right_frames": 0,
         "incomplete_sample_frames": 0,
         "nonfinite_lowdim_frames": 0,
         "invalid_meta_frames": 0,
@@ -118,6 +120,10 @@ def update_clip_quality_stats(
         stats["instruction_num_mismatch_frames"] += 1
     if int(presence) > 0:
         stats["presence_nonzero_frames"] += 1
+    if int(presence) & 1:
+        stats["presence_left_frames"] += 1
+    if int(presence) & 2:
+        stats["presence_right_frames"] += 1
 
     if lowdim is None:
         if count_invalid_lowdim:
@@ -374,6 +380,16 @@ def finalize_clip_quality_metrics(stats: dict) -> dict:
         "frames_kept_candidate": int(stats["frames_kept_candidate"]),
         "presence_ratio": (
             float(stats["presence_nonzero_frames"]) / float(stats["frames_total"])
+            if stats["frames_total"] > 0
+            else 0.0
+        ),
+        "presence_left_ratio": (
+            float(stats["presence_left_frames"]) / float(stats["frames_total"])
+            if stats["frames_total"] > 0
+            else 0.0
+        ),
+        "presence_right_ratio": (
+            float(stats["presence_right_frames"]) / float(stats["frames_total"])
             if stats["frames_total"] > 0
             else 0.0
         ),

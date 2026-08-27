@@ -91,6 +91,13 @@ def decide_clip_quality(
         reasons.append("instruction_num_below_min")
     if criteria.get("min_presence_ratio") is not None and metrics["presence_ratio"] < criteria["min_presence_ratio"]:
         reasons.append("presence_ratio_below_min")
+    # Per-hand presence gate: Stage-1 certified two visible hands for these datasets
+    # (min_hands=2), so reconstruction must deliver valid poses for BOTH hands.
+    if criteria.get("min_presence_ratio_per_hand") is not None and (
+        min(metrics["presence_left_ratio"], metrics["presence_right_ratio"])
+        < criteria["min_presence_ratio_per_hand"]
+    ):
+        reasons.append("single_valid_hand")
     if (
         criteria.get("max_hand_translation_step") is not None
         and metrics["max_hand_translation_step"] > criteria["max_hand_translation_step"]
