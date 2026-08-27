@@ -678,12 +678,21 @@ class OpenTouchHdf5Extractor:
 
     Metric-integrity gates (W9 probe, 2026-08-25): sessions are BIMODAL in camera-space
     wrist depth — ~10 sessions at a plausible 0.50-0.88 m working distance, ~16 sessions
-    at 1.3-1.9 m, beyond human arm reach for the wearer's own hand (per-session SLAM
-    scale inconsistency: u/v projection still locks because the error is along the camera
-    ray, but the 3D is not metric — and Phase-D's population-relative IQR gates would
-    happily keep it). Clips whose median valid wrist depth exceeds ``max_wrist_z`` are
-    rejected at conversion (``depth_implausible``), as are clips the dataset itself labels
-    ``hand_out_of_frame`` (tracker emits garbage while the hand is invisible).
+    at 1.3-1.9 m, beyond human arm reach for the wearer's own hand. Clips whose median
+    valid wrist depth exceeds ``max_wrist_z`` are rejected at conversion
+    (``depth_implausible``), as are clips the dataset itself labels ``hand_out_of_frame``.
+
+    DO NOT INGEST (W9 reprojection gate, 2026-08-27 — scripts/inspection/
+    opentouch_reproj_gate.py, verdict at egosmith_filtered/opentouch/probe/reproj_gate/):
+    ``camera_poses`` are the IDENTITY in every frame of all 26 sessions, so the audited
+    chain was vacuous (all pose-dependent candidates coincide) and the 'SLAM scale'
+    reading of the depth bimodality was wrong — landmarks live in an undocumented
+    device-like frame. Projected GT misses the visible glove by 102-234 px (median 157 px
+    vs manual wrist annotations, n=5 over 3 depth-plausible sessions); no global or
+    per-session rigid correction reaches the 25 px bar, and the tracker emits NON-stale
+    garbage during tracking loss (landmarks freeze while the hand moves, bit-different
+    every frame), which the stale-eps validity gate cannot detect. Kept for provenance;
+    native ingestion requires GT repair (re-tracking), not this adapter.
     """
 
     def __init__(self, local_dir, sessions=None, stale_eps=1e-12, min_frames=3,
