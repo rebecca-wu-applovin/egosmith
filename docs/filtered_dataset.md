@@ -82,6 +82,16 @@ an exact subset of `gt_joints` — validated per clip at conversion, max err 0.0
 `frame_offsets` stayed valid); the pre-retrofit manifest is backed up at
 `filter_run/_prev21_backup/`. Built by `scripts/build/retrofit_egodex_gt_joints.py`.
 
+### Out-of-scope prefixes (user decisions, 2026-08-27)
+- `taco-brush-allegro`, `taco-brush-sharpa`, `taco-overall-sharpa(-mirror)` — retargeted
+  Allegro/Sharpa robot-hand trajectories derived from TACO (sim scenes + trajectory npz,
+  NO RGB video → the L1+L4+LLM pipeline cannot apply). Source demos already in the corpus
+  via `taco`. Ignored.
+- `taco-dataset-pre-release` — pre-release TACO depth videos, redundant with the processed
+  TACO. Ignored.
+- EgoVerse `test_*` splits (test_aria, test_eva, test_eva2, proc_test_aria, scale_old,
+  scale_test) — HELD OUT pending user confirmation (probable eval splits/duplicates).
+
 ## Record / descriptor schema
 
 Each manifest line is a `ClipManifestRecord`
