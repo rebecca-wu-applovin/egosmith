@@ -67,6 +67,9 @@ class WiyhNativeExtractor:
         self.focal = float(pinhole_focal)
         self.jq = int(jpeg_quality)
         self.gate_px = float(gate_px)
+        # session-keyed accepted extrinsics (wiyh_finalize_anchors.py output):
+        # anchoring is PER SESSION — strap re-donning breaks rotation transfer
+        # even within a device-day (measured on 27094 2025-10-25).
         self.extr = json.loads(Path(extrinsics_path).read_text())
         self.locked = {}
         for l in open(census_path):
@@ -87,8 +90,8 @@ class WiyhNativeExtractor:
         for session, members in sess.items():
             if session not in self.locked:
                 continue
-            dd = f"{members[0]['dev']}_{members[0]['date']}"
-            if dd not in self.extr or self.extr[dd].get("status") != "pass":
+            e = self.extr.get(session)
+            if not e or e.get("status") != "pass":
                 continue
             for m in members:
                 if m["size"] <= 100_000_000:  # stub exports
@@ -110,7 +113,7 @@ class WiyhNativeExtractor:
         self._load_members()
         m = self._members[episode_ref]
         dd = f"{m['dev']}_{m['date']}"
-        ex = self.extr[dd]
+        ex = self.extr[m["session"]]
         fs = gcsfs.GCSFileSystem()
         h5, masks, jpgs_raw = stream_sample(fs, self._parts[m["scene"]], m, want_jpgs=True)
         if h5 is None:
@@ -183,7 +186,10 @@ class WiyhNativeExtractor:
             frame_meta=frame_meta,
             task=task, desc=desc, episode_name=clip_base(m["base"]),
             extra={"session": m["session"], "device_day": dd, "scene": m["scene"],
-                   "anchor_extrinsic": dd, "gt_mode": "wiyh_native_25joint",
+                   "anchor_extrinsic": m["session"],
+                   "anchor_acceptance": ex.get("acceptance", "unknown"),
+                   "anchor_fit_px": {s: ex[s].get("fit_med_px") for s in ("left", "right")},
+                   "gt_mode": "wiyh_native_25joint",
                    "finger_quality": FINGER_QUALITY,
                    "wrist_gate_px": self.gate_px,
                    "gate_frac": {s: float(valid[s].mean()) for s in ("left", "right")},

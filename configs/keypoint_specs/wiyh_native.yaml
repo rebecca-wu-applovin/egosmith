@@ -14,7 +14,7 @@ presence_requires_projection: true
 extractor_args:
   index_dir: /root/w7_full/wiyh/index
   census_path: /root/w7_native/census/census.jsonl
-  extrinsics_path: /root/w7_native/anchors/extrinsics.json
+  extrinsics_path: /root/w7_native/anchors/accepted_extrinsics.json
   out_width: 456
   out_height: 256
   pinhole_focal: 120.0
