@@ -628,8 +628,13 @@ def render_dataset(ds, n, seed, work):
             else:
                 fs.get(gcs_tar, str(tar_local))  # surface the original error
             seq = materialize_seq(f"{ad['outputs']}/{cid}", wdir / "_seq" / cid)
-        elif "filt" in ad:  # sharded native GT: frames/shard_XXXXX/<cid>.tar
-            gcs_tar = f"{ad['frames']}/shard_{s['shard']}/{cid}.tar"
+        elif "filt" in ad:  # sharded native GT: frames[_v2]/shard_XXXXX/<cid>.tar
+            # kept clips: follow the manifest's own shard_path when absolute (tracks
+            # the gt_joints retrofit flip to frames_v2/); dropped clips carry local
+            # converter paths -> fall back to the frames mirror, then re-convert
+            sp = d.get("shard_path") or ""
+            gcs_tar = (sp.replace("gs://", "") if sp.startswith("gs://")
+                       else f"{ad['frames']}/shard_{s['shard']}/{cid}.tar")
             if fs.exists(gcs_tar):
                 fs.get(gcs_tar, str(tar_local))
             else:  # dropped clips: kept-only mirror -> re-convert from source episode

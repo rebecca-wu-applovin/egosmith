@@ -284,9 +284,17 @@ def _gt_align_px(lds, jpg_names, gt_joints):
     return float(np.median(errs)) if errs else None
 
 
-def _load_tar_gt25(tar_path, jpg_names):
-    """Per-frame (2,25,3) .gt_joints.npy members (wiyh_manus_world_25_v1) matching the
-    jpg order, or None if absent/not 25-joint."""
+# in-tar .gt_joints.npy layouts: joint count J -> (edges, wrist idx, tip indices)
+GTJ_LAYOUTS = {
+    21: (EDGES, 0, GT_TIP_IDX),                      # MANO/OpenPose order (egodex,
+                                                     # egoverse_* native retrofits)
+    25: (EDGES_MANUS25, MANUS25_WRIST, MANUS25_TIPS),  # MANUS glove order (wiyh_native)
+}
+
+
+def _load_tar_gtj(tar_path, jpg_names):
+    """Per-frame (2,J,3) .gt_joints.npy members matching the jpg order, or None if
+    absent / inconsistent / J not a known layout (see GTJ_LAYOUTS)."""
     arrs = {}
     with tarfile.open(tar_path) as tf:
         for m in tf:
@@ -295,16 +303,22 @@ def _load_tar_gt25(tar_path, jpg_names):
     if not arrs:
         return None
     out = [arrs.get(j[: -len(".image.jpg")] + ".gt_joints.npy") for j in jpg_names]
-    if any(v is None or v.shape != (2, 25, 3) for v in out):
+    shapes = {None if v is None else v.shape for v in out}
+    if len(shapes) != 1:
+        return None
+    shape = shapes.pop()
+    if shape is None or len(shape) != 3 or shape[0] != 2 or shape[2] != 3 \
+            or shape[1] not in GTJ_LAYOUTS:
         return None
     return out
 
 
-def _gt25_align_px(lds, gt25):
+def _gtj_align_px(lds, gtj):
     """Median projected px distance between the lowdim wrist+5tips and the same 6
-    points from the in-tar 25-joint GT (retrofit exactness check; should be ~0)."""
+    points from the in-tar (2,J,3) GT (retrofit exactness check; should be ~0)."""
+    _, wrist_idx, tip_idx = GTJ_LAYOUTS[gtj[0].shape[1]]
     errs = []
-    for ld, g in zip(lds, gt25):
+    for ld, g in zip(lds, gtj):
         if ld is None or g is None:
             continue
         ld = ld.reshape(-1)
@@ -324,8 +338,10 @@ def _gt25_align_px(lds, gt25):
             wrist = ld[sl_w].reshape(1, 3)
             if np.abs(wrist).max() < 1e-8:
                 continue  # absent hand
+            if np.abs(g[hi]).max() < 1e-8:
+                continue  # untracked hand-frame sentinel (all-zero gt)
             ld6 = np.concatenate([wrist, ld[sl_t].reshape(5, 3)])
-            gt6 = g[hi][[MANUS25_WRIST] + MANUS25_TIPS]
+            gt6 = g[hi][[wrist_idx] + tip_idx]
             if not (np.isfinite(ld6).all() and np.isfinite(gt6).all()):
                 continue
             errs += list(np.linalg.norm(_uv(ld6) - _uv(gt6), axis=1))
@@ -335,8 +351,9 @@ def _gt25_align_px(lds, gt25):
 def render_native_overlay(tar_path, out_mp4, fps=30.0, gt_joints=None):
     """Native-lowdim overlay. Full skeletons when raw-GT world joints are supplied
     (EgoDex raw hdf5, egodex_rawgt.py), in-tar per-frame .gt_joints.npy ships
-    (wiyh_native 25-joint retrofit) or real .mano.npy ships in the tar;
-    wrist+fingertips fallback otherwise (keypoints-only datasets)."""
+    (wiyh_native 25-joint / egoverse+egodex 21-joint retrofits, native converter
+    emission) or real .mano.npy ships in the tar; wrist+fingertips fallback
+    otherwise (keypoints-only datasets)."""
     frames, lds = load_tar_frames(tar_path)
     if not frames:
         raise RuntimeError(f"no frames in {tar_path}")
@@ -346,15 +363,16 @@ def render_native_overlay(tar_path, out_mp4, fps=30.0, gt_joints=None):
         jpg_names = sorted(n for n in tf.getnames() if n.endswith(".image.jpg"))
     note, gt_align = None, None
     joints = None
-    gt25 = None
+    gtj, gtj_edges, gtj_wrist = None, EDGES, 0
     if gt_joints is None:
-        gt25 = _load_tar_gt25(tar_path, jpg_names)
-        if gt25 is not None:
-            gt_align = _gt25_align_px(lds, gt25)
+        gtj = _load_tar_gtj(tar_path, jpg_names)
+        if gtj is not None:
+            gtj_edges, gtj_wrist, _ = GTJ_LAYOUTS[gtj[0].shape[1]]
+            gt_align = _gtj_align_px(lds, gtj)
             if gt_align is None or gt_align > GT_ALIGN_MAX_PX:
-                note = (f"in-tar 25-joint GT misaligned (median {gt_align} px "
-                        f"> {GT_ALIGN_MAX_PX}) -> 6-pt fallback")
-                gt25 = None
+                note = (f"in-tar {gtj[0].shape[1]}-joint GT misaligned "
+                        f"(median {gt_align} px > {GT_ALIGN_MAX_PX}) -> 6-pt fallback")
+                gtj = None
     if gt_joints is not None:
         # raw-GT skeletons index by SOURCE frame number (tar frames are 1:1 with the
         # hdf5 timesteps) — validate by matching the lowdim's own wrist+tips
@@ -399,9 +417,11 @@ def render_native_overlay(tar_path, out_mp4, fps=30.0, gt_joints=None):
                     continue  # absent hand (presence bitmask semantics)
                 if gt_joints is not None and gt_t < gt_joints[hi].shape[0]:
                     n += draw_skel(im, _proj(gt_joints[hi][gt_t]), col)
-                elif gt25 is not None and gt25[t] is not None:
-                    n += draw_skel(im, _proj(gt25[t][hi]), col,
-                                   edges=EDGES_MANUS25, wrist=MANUS25_WRIST)
+                elif gtj is not None and gtj[t] is not None \
+                        and np.abs(gtj[t][hi]).max() > 1e-8:
+                    # all-zero hand-frame = untracked sentinel -> draw nothing
+                    n += draw_skel(im, _proj(gtj[t][hi]), col,
+                                   edges=gtj_edges, wrist=gtj_wrist)
                 elif joints is not None:
                     n += draw_skel(im, _proj(joints[hi][t]), col)
                 else:
