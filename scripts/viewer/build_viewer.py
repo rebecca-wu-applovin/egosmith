@@ -58,6 +58,18 @@ def _ego_adapter(ds, **kw):
                 recon=f"{BUCKET}/egosmith_recon/{ds}/recon/outputs", **kw)
 
 
+def _native_sharded_adapter(ds, fps=30.0, **kw):
+    """Native-GT dataset in the sharded ego-style layout: per-shard filtered manifests +
+    per-shard v4 annotations + frames/shard_XXXXX/<cid>.tar; no recon outputs (overlay
+    comes from the in-tar lowdim). Dropped examples come from the stage-4 drop reports
+    under native/_shards/reports/."""
+    return dict(kind="native", fps=fps,
+                filt=f"{BUCKET}/egosmith_filtered/{ds}/filter_run/_shards",
+                ann=f"{BUCKET}/egosmith_filtered/{ds}/filter_run/annotations_v4/_shards",
+                frames=f"{BUCKET}/egosmith_filtered/{ds}/frames",
+                native=f"{BUCKET}/egosmith_filtered/{ds}/native/_shards", **kw)
+
+
 ADAPTERS = {
     "egocentric100k": dict(kind="ego", fps=15.0,
                            filt=f"{BUCKET}/egosmith_filtered/egocentric100k/filter_run/_shards",
@@ -127,15 +139,32 @@ ADAPTERS = {
     # native lowdim (Vision Pro GT); full 21-joint skeletons pulled per clip from the
     # raw EgoDex hdf5s (ranged zip reads, egodex_rawgt.py) — lowdim carries only 6 pts
     "egodex": dict(kind="native", fps=30.0, raw_gt="egodex"),
-    # EgoVerse 2026-08-28 ships: freeform = recon conveyor; the rest = native GT
+    # EgoVerse 2026-08-28 ships: freeform = recon conveyor; the rest = native GT.
+    # Native datasets use the SHARDED layout (filter_run/_shards + annotations_v4/_shards
+    # + frames/shard_XXXXX/) — _native_sharded_adapter joins annotations per shard and
+    # sources dropped examples from native/_shards/reports/shard_X/s4.json.
+    # fps notes: scale/flagship/lightwheel per-clip fps is uniformly 30.0 (convert.json).
+    # microagi episodes are MOSTLY 30fps at the source, but the whole build (funnel
+    # kept-hours AND v4 annotation segment times) used the 29fps default — render at 29
+    # so segment cuts stay aligned with annotations (worst case 3.4% slow playback).
     "egoverse_mecka_freeform": _ego_adapter("egoverse_mecka_freeform"),
-    "egoverse_mecka_flagship": dict(kind="native", fps=30.0),
-    "egoverse_lightwheel": dict(kind="native", fps=30.0),
-    "egoverse_microagi": dict(kind="native", fps=29.0),
-    "egoverse_scale": dict(kind="native", fps=30.0),
+    "egoverse_mecka_flagship": _native_sharded_adapter("egoverse_mecka_flagship"),
+    "egoverse_lightwheel": _native_sharded_adapter("egoverse_lightwheel"),
+    "egoverse_microagi": _native_sharded_adapter("egoverse_microagi", fps=29.0,
+                                                 shards_k=20),
+    "egoverse_scale": _native_sharded_adapter("egoverse_scale"),
     # WIYH native tier: 25-joint glove GT via per-session anchor solve; tagged
-    # finger_quality=approximate_35_65px (see egosmith_filtered/wiyh_native/FILTER_MODE.txt)
-    "wiyh_native": dict(kind="native", fps=10.0),
+    # finger_quality=approximate_35_65px (see egosmith_filtered/wiyh_native/FILTER_MODE.txt).
+    # Post strict-audit remediation (2026-08-28): manifest = 440 survivors pointing at
+    # frames_v2/ (per-frame .gt_joints.npy -> full 25-joint MANUS overlays); dropped
+    # examples come from the remediation drop manifest (anchor_rotation_invalid), whose
+    # v1 tars now live under _dropped_20260828/frames/.
+    "wiyh_native": dict(
+        kind="native", fps=10.0,
+        dropped_manifest=f"{BUCKET}/egosmith_filtered/wiyh_native/filter_run/"
+                         "clip_manifest.filtered.remediationdropped.jsonl",
+        dropped_frames=f"{BUCKET}/egosmith_filtered/wiyh_native/_dropped_20260828/frames",
+        dropped_reason="anchor_rotation_invalid"),
 }
 
 # Datasets dropped from the shipped set (tombstoned, data preserved on the bucket —
@@ -218,7 +247,11 @@ def sample_ego(ds, ad, n, seed, shards_k=10):
             {r["clip_id"]: r for r in _read_jsonl_gcs(f"{ad['ann']}/{sh}.annotations.jsonl")}
         joined = [r for r in recs if r["clip_id"] in anns]
         for r in rng.sample(joined, min(per, len(joined))):
-            sfx = re.search(r"(\d{5})", r["descriptor"]["root_dir"]).group(1)
+            # shard suffix from root_dir when it carries one (ego conveyor layout);
+            # fall back to the filter-shard name (egoverse freeform's root_dir is a
+            # local scratch path like .../mkf_shard0 with no 5-digit suffix)
+            m = re.search(r"(\d{5})", r["descriptor"]["root_dir"])
+            sfx = m.group(1) if m else sh.replace("shard_", "")
             out.append(dict(rec=r, ann=anns[r["clip_id"]], shard=sfx))
     return out[:n]
 
@@ -259,6 +292,94 @@ def sample_dropped_ego(ds, ad, n, seed):
     return out[:n]
 
 
+def sample_dropped_native(ds, ad, n, seed):
+    """Dropped examples for sharded native-GT datasets: stage-4 drop reports under
+    native/_shards/reports/shard_X/s4.json carry {clip_id, reasons}; descriptors come
+    from the per-shard full manifest. The bucket mirrors KEPT frames tars only, so each
+    sample also carries its source-episode ref (from the shard convert.json) for
+    on-demand local re-conversion at fetch time."""
+    rng = random.Random(seed + 1)
+    shard_dirs = [p for p in fs.ls(f"{ad['native']}/reports") if "shard_" in p]
+    out, seen_reasons = [], {}
+    for sd in rng.sample(shard_dirs, min(12, len(shard_dirs))):
+        if len(out) >= n:
+            break
+        sd = sd.rstrip("/")
+        sh = os.path.basename(sd)                      # shard_00000
+        sfx = sh.replace("shard_", "")
+        rp = f"{sd}/s4.json"
+        if not fs.exists(rp):
+            continue
+        rep = json.loads(fs.open(rp, "rb").read())
+        dropped = [d for d in rep.get("dropped", [])
+                   if d.get("drop_category", "quality") == "quality"]
+        rng.shuffle(dropped)
+        picked = []
+        for d in dropped:  # spread across distinct primary reasons
+            key = (d.get("reasons") or ["?"])[0]
+            if seen_reasons.get(key, 0) >= max(2, n // 5):
+                continue
+            seen_reasons[key] = seen_reasons.get(key, 0) + 1
+            picked.append(d)
+            if len(picked) >= 2:
+                break
+        if not picked:
+            continue
+        by_id = {d["clip_id"]: d for d in picked}
+        conv = json.loads(fs.open(f"{sd}/convert.json", "rb").read())
+        ep_by_id = {r["clip_id"]: r.get("episode") for r in conv.get("results", [])
+                    if r.get("clip_id") in by_id}
+        iv = f"{sd}/intervals.json"
+        iv_gcs = iv if fs.exists(iv) else None         # stage-1 gated conversions
+        mpath = f"{ad['native']}/{sh}.full.manifest.jsonl"
+        if not fs.exists(mpath):
+            mpath = f"{ad['native']}/{sh}.manifest.jsonl"
+        for line in fs.open(mpath, "rb").read().decode().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r["clip_id"] in by_id:
+                out.append(dict(rec=r, ann=None, shard=sfx,
+                                reasons=by_id[r["clip_id"]].get("reasons", []),
+                                ep_ref=ep_by_id.get(r["clip_id"]), intervals_gcs=iv_gcs))
+    return out[:n]
+
+
+def _reconvert_native_tar(ds, s, tar_local, wdir):
+    """Re-convert one source episode with the production converter params
+    (segment_sec=10, default min_segment_sec) and pull out the target sub-clip tar.
+    Validates the reproduced segmentation against the manifest's frame count."""
+    import shutil
+    cid = s["rec"]["clip_id"]
+    if not s.get("ep_ref"):
+        raise FileNotFoundError(f"{cid}: no episode ref for reconvert")
+    tmp = wdir / "_reconv" / cid
+    tmp.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, str(_REPO / "scripts" / "build" / "generate_keypoints_wds.py"),
+           "--spec", str(_REPO / "configs" / "keypoint_specs" / f"{ds}.yaml"),
+           "--frames_root", str(tmp / "frames"), "--outputs_root", str(tmp / "outputs"),
+           "--manifest_out", str(tmp / "manifest.jsonl"),
+           "--report_out", str(tmp / "convert.json"),
+           "--workers", "1", "--segment_sec", "10.0", "--episodes", s["ep_ref"]]
+    if s.get("intervals_gcs"):
+        fs.get(s["intervals_gcs"], str(tmp / "intervals.json"))
+        cmd += ["--intervals_json", str(tmp / "intervals.json")]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
+    src = tmp / "frames" / f"{cid}.tar"
+    if not src.exists():
+        raise FileNotFoundError(f"reconvert produced no {cid}.tar")
+    want = len(s["rec"]["descriptor"].get("frame_names") or [])
+    if want:
+        import tarfile
+        with tarfile.open(src) as tf:
+            got = sum(1 for m in tf.getnames() if m.endswith(".image.jpg"))
+        if got != want:
+            raise RuntimeError(f"reconvert segmentation drift: {got} frames != {want}")
+    shutil.move(str(src), str(tar_local))
+    shutil.rmtree(tmp, ignore_errors=True)
+    return tar_local
+
+
 def sample_dropped_cat3(ds, ad, n, seed):
     rng = random.Random(seed + 1)
     base = f"{BUCKET}/egosmith_filtered/{ds}/filter_run"
@@ -279,6 +400,19 @@ def sample_dropped_cat3(ds, ad, n, seed):
         r = recs.get(d["clip_id"])
         if r:
             out.append(dict(rec=r, ann=None, shard=None, reasons=d.get("reasons", [])))
+    return out
+
+
+def sample_dropped_manifest(ds, ad, n, seed):
+    """Dropped examples from an explicit drop manifest (wiyh_native strict-audit
+    remediation): full records whose tars were moved to ad['dropped_frames']."""
+    rng = random.Random(seed + 1)
+    recs = _read_jsonl_gcs(ad["dropped_manifest"])
+    out = []
+    for r in rng.sample(recs, min(n, len(recs))):
+        d = r["descriptor"]
+        d["shard_path"] = f"gs://{ad['dropped_frames']}/{os.path.basename(d['shard_path'])}"
+        out.append(dict(rec=r, ann=None, shard=None, reasons=[ad["dropped_reason"]]))
     return out
 
 
@@ -359,12 +493,15 @@ def render_dataset(ds, n, seed, work):
         return
 
     n_dropped = max(6, n // 5)
-    if ad["kind"] == "ego":
+    if "filt" in ad:  # sharded layout (ego conveyor OR sharded native GT)
         samples = sample_ego(ds, ad, n, seed, shards_k=ad.get("shards_k", 10))
-        dropped = sample_dropped_ego(ds, ad, n_dropped, seed)
+        dropped = (sample_dropped_native(ds, ad, n_dropped, seed) if "native" in ad
+                   else sample_dropped_ego(ds, ad, n_dropped, seed))
     else:
         samples = sample_cat3(ds, ad, n, seed)
-        dropped = sample_dropped_cat3(ds, ad, n_dropped, seed)
+        dropped = (sample_dropped_manifest(ds, ad, n_dropped, seed)
+                   if "dropped_manifest" in ad
+                   else sample_dropped_cat3(ds, ad, n_dropped, seed))
     for s in samples:
         s["section"] = "kept"
     for s in dropped:
@@ -385,9 +522,22 @@ def render_dataset(ds, n, seed, work):
             fs.get(f"{BUCKET}/egosmith_filtered/{ds}/frames/{os.path.basename(d['shard_path'])}",
                    str(tar_local))
             seq = materialize_seq(f"{ad['outputs']}/{cid}", wdir / "_seq" / cid)
-        else:  # native
-            fs.get(f"{BUCKET}/egosmith_filtered/{ds}/frames/{os.path.basename(d['shard_path'])}",
-                   str(tar_local))
+        elif "filt" in ad:  # sharded native GT: frames/shard_XXXXX/<cid>.tar
+            gcs_tar = f"{ad['frames']}/shard_{s['shard']}/{cid}.tar"
+            if fs.exists(gcs_tar):
+                fs.get(gcs_tar, str(tar_local))
+            else:  # dropped clips: kept-only mirror -> re-convert from source episode
+                _reconvert_native_tar(ds, s, tar_local, wdir)
+            seq = None
+        else:  # flat native (egodex/wiyh_native): descriptor shard_path (gs://) when
+            # absolute — follows manifest flips to frames_v2/ and the wiyh_native
+            # remediation-dropped tars; frames/<basename> fallback otherwise
+            sp = d["shard_path"]
+            if sp.startswith("gs://"):
+                fs.get(sp.replace("gs://", ""), str(tar_local))
+            else:
+                fs.get(f"{BUCKET}/egosmith_filtered/{ds}/frames/{os.path.basename(sp)}",
+                       str(tar_local))
             seq = None
         return tar_local, seq
 
@@ -693,12 +843,17 @@ def dataset_html(ds, cards, stats):
             f'{dropped_html}<script>{SEG_JS}</script></body></html>')
 
 
-def root_html(rows):
+def root_html(rows, totals=None):
     trs = "".join(
         f'<tr><td><a href="{AUTH_BASE}/{esc(ds)}/index.html">{esc(ds)}</a></td><td>{esc(cat)}</td>'
         f'<td class="num"><b>{esc(hours)}</b></td>'
         f'<td class="num">{n}</td><td class="num">{ov}</td></tr>'
         for ds, cat, hours, n, ov in rows)
+    if totals:
+        th, tn, tov = totals
+        trs += (f'<tr><td><b>total</b> ({len(rows)} datasets)</td><td></td>'
+                f'<td class="num"><b>{th:,.0f}</b></td>'
+                f'<td class="num"><b>{tn}</b></td><td class="num"><b>{tov}</b></td></tr>')
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<title>EgoSmith filtered data viewer</title><style>{CSS}</style></head><body>'
@@ -722,6 +877,10 @@ KEPT_HOURS = {
     "arctic": 1.61, "dexcap": 0.79, "h2o": 0.85,
     "trex": 44.7, "dexora": 39.75, "dexwild": 5.22,
     "hrdexdb_allegro": 0.32, "realdex": 1.16,
+    # EgoVerse 2026-08-28 ships (funnel.json values; funnel overrides live anyway)
+    "egoverse_microagi": 1658.18, "egoverse_mecka_freeform": 785.91,
+    "egoverse_scale": 140.83, "egoverse_mecka_flagship": 97.64,
+    "egoverse_lightwheel": 43.49,
 }
 
 
@@ -778,17 +937,18 @@ def publish(ds, work, upload_clips=True):
     subprocess.run(["gcloud", "storage", "cp", "--content-type=text/html", "--cache-control=no-store", "-q",
                     str(page), f"{dst}/index.html"], check=True)
     if upload_clips:
-        subprocess.run(["gcloud", "storage", "cp", "--content-type=video/mp4", "-q"]
+        subprocess.run(["gcloud", "storage", "cp", "--content-type=video/mp4",
+                        "--cache-control=no-store", "-q"]
                        + [str(p) for p in sorted((wdir / "clips").glob("*.mp4"))]
                        + [f"{dst}/clips/"], check=True)
-        subprocess.run(["gcloud", "storage", "cp", "-q", str(wdir / "cards.json"),
-                        f"{dst}/cards.json"], check=True)
+        subprocess.run(["gcloud", "storage", "cp", "--cache-control=no-store", "-q",
+                        str(wdir / "cards.json"), f"{dst}/cards.json"], check=True)
     print(f"[{ds}] published -> https://storage.cloud.google.com/{VIEWER}/{ds}/index.html",
           flush=True)
 
 
 def build_root(work):
-    rows = []
+    rows, tot_h, tot_n, tot_ov = [], 0.0, 0, 0
     for p in sorted(fs.ls(VIEWER)):
         ds = os.path.basename(p.rstrip("/"))
         if ds.startswith("_") or ds.endswith(".html") or ds in DROPPED:
@@ -801,8 +961,9 @@ def build_root(work):
         h = dataset_kept_hours(ds, ADAPTERS.get(ds))
         hours = ("—" if h is None else f"{h:,.2f}" if h < 100 else f"{h:,.0f}")
         rows.append((ds, CATEGORY.get(ds, "—"), hours, len(cards), ov))
+        tot_h, tot_n, tot_ov = tot_h + (h or 0.0), tot_n + len(cards), tot_ov + ov
     out = work / "index.html"
-    out.write_text(root_html(rows))
+    out.write_text(root_html(rows, totals=(tot_h, tot_n, tot_ov)))
     subprocess.run(["gcloud", "storage", "cp", "--content-type=text/html", "--cache-control=no-store", "-q",
                     str(out), f"gs://{VIEWER}/index.html"], check=True)
     print(f"root -> https://storage.cloud.google.com/{VIEWER}/index.html", flush=True)
