@@ -38,19 +38,31 @@ egosmith_filtered/
 | oakink_actions | 2,488 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | egodex | 158,564 | native — GT read straight from the tar | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` + `.gt_joints.npy` |
 | h2o | 149 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
-| wiyh_native | see `filter_run/BUCKET_AUDIT.json` | native (TAGGED) — 25-joint glove GT via per-session anchor solve | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (with per-frame `gate_px`) |
-| humantouch | 51,022 (126.6 h) | `gt_derived_extrinsic_block_anchor` — MANUS glove GT staged to MANO; camera extrinsic per mount-cluster from 118 vision-annotated anchors (7° fingerprint cover, gated propagation) → `world_space_res.pth` | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
+| gigahands | 11,542 (27.47 h) | `use_gt` — EasyMocap bimanual MANO GT + per-scene calib → `world_space_res.pth` (probe 1.6–2.1 mm) | `.image.jpg` |
+| wiyh_native | 440 (1.16 h, 12 sessions; post strict-audit remediation 2026-08-28) | native (TAGGED) — 25-joint glove GT via per-session anchor solve | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (with per-frame `gate_px`) + `.gt_joints.npy` (frames_v2) |
+| humantouch | 50,475 (125.2 h) | `gt_derived_extrinsic_block_anchor` — MANUS glove GT staged to MANO; camera extrinsic per mount-cluster from 118 vision-annotated anchors (4.5° assignment cap post-remediation, gated propagation) → `world_space_res.pth` | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
 | egoverse_mecka_freeform | 56,365 (785.9 h) | recon — HaWoR conveyor (456w/15fps, anycalib, Phase-D with BOTH presence gates) | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
 | egoverse_mecka_flagship | 45,224 (97.6 h) | native — in-zarr 21-kpt GT (convention A) → 116-d lowdim; frames = in-zarr 640×360 JPEGs | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (sharded `frames/shard_XXXXX/`) |
 | egoverse_lightwheel | 25,462 (43.5 h) | native — pose.json 21-kpt world + wrist quat through per-frame R_w2c + undistorted K (1920×1456) | same native payload (sharded) |
 | egoverse_microagi | 649,264 (1,658.2 h @29 fps) | native — in-zarr 21-kpt GT; annotations text-seeded (see caveat) | same native payload (sharded) |
 | egoverse_scale | 51,574 (140.8 h) | native — in-zarr 21-kpt GT; frames = in-zarr 640×480 JPEGs (`recenter_world` re-gauge applied) | same native payload (sharded) |
+| egoexo4d | 16,516 (39.81 h) | recon — HaWoR conveyor (aria ego RGB, kb4 undistort, 15fps; Phase-D with BOTH presence gates from the first shard) | `.image.jpg` (sharded; manifests in `filter_run/_shards/` + aggregated `clip_manifest.filtered.jsonl`) |
 
 H2O (ETH, ICCV 2021; egocentric cam4 only, 30 fps, two-hands+object tabletop manipulation;
 built by `scripts/build/generate_h2o_world_res.py`, W9 2026-08-25): 184 sequences converted
 (1.06 h) → 149 kept (0.85 h) under the canonical GT filter (`--stages infiller --source_fps 30
 --target_fps 30 --min_presence_ratio 0.5`); drops are motion-step glitches. License: academic
 use only (see `hoi-dataset/H2O/PROVENANCE.md`).
+
+GigaHands (Fu et al., CVPR'25; BRICS multi-camera rig, 30 fps 1280×720, bimanual
+tabletop activities; built by `scripts/build/generate_gigahands_world_res.py`, W6 redo
+2026-08-28): 12,775 sequences → 12,764 converted (32.73 h; single best camera per
+sequence, undistorted to pinhole) → **11,542 kept (27.47 h)** under the canonical GT
+filter with BOTH presence gates (`--min_presence_ratio 0.5
+--min_presence_ratio_per_hand 0.5`, 30 fps step gates). The 2026-08-25 filter pass ran
+without the presence gates and was never shipped (kept as
+`filter_run/filter_report.v1_no_presence_gates.json`). No annotations — shipped under
+the global labeling hold; see `filter_run/BUCKET_AUDIT.json` `annotation_status`.
 
 **WIYH native tier caveat (W7 locked-tier ingestion, 2026-08-28):** `wiyh_native` is a
 TAGGED approximate tier — every record carries `metadata.finger_quality =
@@ -64,7 +76,33 @@ hands ≥80% frames <30 px eef-to-hand-mask; 269/4,420 sessions locked, 43 ancho
 accepted in v1 — the census + per-session anchor registry are additive, so later anchor
 passes can extend the tier without touching shipped clips). Per-frame wrist-gate pixel codes
 ship in every frame's `.meta.json`. `wiyh_native` EXTENDS the `wiyh` recon tier (757 clips,
-disjoint method — that tier stays as-is); see `egosmith_filtered/wiyh_native/filter_run/FILTER_MODE.txt`.
+disjoint method — that tier stays as-is, 744 clips after the presence re-filter);
+see `egosmith_filtered/wiyh_native/filter_run/FILTER_MODE.txt`.
+
+**WIYH native strict-audit remediation (2026-08-28):** a strict per-session re-audit
+(mask-gated + eef-vetoed teal-pad detection, two-way px metric on the original fisheye,
+plus a visual read per session) found **20 of the 32 shipped sessions visually WRONG** —
+auto-anchor ROTATION errors on washed-out Supermarket pads that the fit/holdout gates and
+the v1 post-ship verifier (no mask gating → teal false positives on shelf products) failed
+to catch. The 20 sessions (325 clips, 0.87 h) were dropped with reason
+`anchor_rotation_invalid`; the tier now ships **440 clips / 1.16 h / 12 sessions** (hours
+are frame-count hours; the earlier 1.22 h figure was a 10 s/clip approximation). The keep
+decision is **visual-verdict-driven**: the strict med_b metric floor is scene-dependent
+(pad detectability varies with lighting/background), so 7/12 keepers measure med_b > 60 px
+fisheye while tracking correctly on visual read; measured strict numbers (med_b 41–78 px
+@1920w) are stamped as-is on every record as `metadata.tip_verification` (the unreliable v1
+`tip_verification_med_px_456w` stamps are removed). Annotations were pruned to the 440
+survivors (row deletion only — global labeling hold, no re-labeling). Dropped tars:
+`wiyh_native/_dropped_20260828/frames/`; pre-remediation state + reconciliation:
+`wiyh_native/filter_run/_preremediation_backup_20260828/`. Verifier replaced by the strict
+`scripts/build/wiyh_verify_shipped_tips.py`. **25-joint retrofit:** every surviving clip's
+tar (shipped as `frames_v2/`, append-only rewrite, v1 tars byte-preserved) carries one
+`{frame}.gt_joints.npy = (2, 25, 3) float32` world(=chest)-frame MANUS skeleton per frame
+(index 0 = left; thumb 0–3, index 4–8, middle 9–13, ring 14–18, little 19–23, wrist 24;
+tips [3,8,13,18,23]), recomputed from source exactly as the extractor and validated per
+clip against the shipped lowdim wrist+tips;
+`descriptor.extra.gt_joints_schema = "wiyh_manus_world_25_v1"`
+(`scripts/build/retrofit_wiyh_gt_joints.py`).
 
 **DexCap caveat (audit 2026-08-25):** every kept clip carries
 `metadata.finger_articulation_unreliable=true` (`severity: severe` for `packaging_*`,
@@ -82,8 +120,24 @@ reprojects 60–100 px off across the dataset (glove-internal calibration) — t
 thumb articulation as lower confidence. Per-clip provenance:
 `descriptor.extra.mount_block` + `block_fit_median_px`. Full details:
 `egosmith_filtered/humantouch/filter_run/FILTER_MODE.txt`; anchor evidence:
-`filter_run/anchor_audit/` + `filter_run/anchor_results/`. LLM annotations pending
-(key + budget re-approval).
+`filter_run/anchor_audit/` + `filter_run/anchor_results/`. LABELING HOLD
+(user-ordered 2026-08-28): the tier ships unlabeled — no LLM annotations.
+
+**HumanTouch remediation (2026-08-28):** a stratified 100-clip visual alignment
+audit found ~0.8% of clips visually off, concentrated in far anchor assignments
+and 6 mount blocks. Remediation applied to the shipped tier: (1) anchor-assignment
+radius tightened to **4.5°** (436 clips dropped); (2) per-episode render QA of
+blocks A029/A060/A119/A085/A097/A098 (1,329 episodes; 578 renders visually read)
+dropped 40 visually-off episodes (111 clips). Post-remediation: **50,475 clips /
+125.2 h**. Dropped tars preserved under `humantouch/_dropped_20260828/frames/`;
+reconciliation `filter_run/remediation_20260828.json`; pre-change backup
+`filter_run/_preremediation_backup_20260828/`. Standing ship gate: any re-ship
+must run `scripts/build/humantouch_ship_gate_qa.py` (≥100-clip stratified
+visual QA, weighted off-rate ≤ 2%). **Gate result 2026-08-28: FAIL** — 6/100
+visually off (bin-weighted 5.9%), a scattered per-episode mis-assignment long
+tail across 6 non-remediated blocks (inside the original audit's 0.2–9.3%
+band). Treat clip-level alignment as ~94% locked / ~6% off until a follow-up
+pass is approved; evidence `filter_run/ship_gate_qa_20260828/`.
 
 **EgoVerse ships (2026-08-28, five datasets):**
 - **mecka freeform/flagship dedup-by-construction:** 3,300 episode ids exist in BOTH
@@ -118,6 +172,56 @@ thumb articulation as lower confidence. Per-clip provenance:
 - Stage-1 interval gating: lightwheel and flagship converted only Stage-1 kept spans;
   microagi/scale ran the on-pod Stage-1 prefilter (tuned `min_area 0.005`, `min_hands 1`
   configs — production `min_area 0.02` kept 3/21 on the microagi pilot).
+
+## Presence re-filter (2026-08-27/28) — empty-pose + single-valid-hand purge
+
+Two keep-classes were purged from every shipped **recon-path** dataset whose Stage-1
+certified two visible hands (`min_hands=2`):
+
+- `empty_pose` — any-hand valid-pose ratio < 0.5 (clips with zero/near-zero valid
+  reconstructed poses passed the old motion gates trivially; the presence gate was off
+  when egocentric100k/10k were filtered),
+- `single_valid_hand` — either hand's valid ratio < 0.5 (Stage-1 promised two hands;
+  reconstruction delivered one).
+
+Mechanics: `scripts/build/presence_refilter.py` ranged-reads each kept clip's
+`pred_valid (2,T)` from its `result.npz` on GCS, rewrites the per-shard filtered
+manifests, and prunes annotation rows for dropped clips (row deletion only — the global
+labeling hold forbids new labels). Backup-first: originals live in each dataset's
+`filter_run/_prepresence2_backup/`; totals + per-clip drop lists in
+`filter_run/presence_refilter_reconciliation.json`. Top-level
+`clip_manifest.filtered.jsonl` / `funnel.json` aggregates were rebuilt from the purged
+shards where they exist (100k via server-side GCS compose, byte-sum verified).
+
+| dataset | kept before → after | empty_pose | single_valid_hand | removed hours |
+|---|---:|---:|---:|---:|
+| egocentric100k | 13,111,076 → 12,811,150 | 27,170 | 272,756 | 272.7 |
+| egocentric10k | 1,337,259 → 1,305,039 | 3,757 | 28,463 | 31.4 |
+| ego4d | 137,106 → 127,944 | 0 | 9,162 | 12.0 |
+| holoassist | 18,403 → 17,981 | 0 | 422 | 0.4 |
+| assembly101 | 14,303 → 13,910 | 0 | 393 | 0.4 |
+| epic_kitchens_100 | 11,864 → 11,643 | 0 | 221 | 0.2 |
+| egoverse_aria_v2 | 6,903 → 6,802 | 0 | 101 | 0.1 |
+| hd_epic | 2,248 → 2,191 | 0 | 57 | 0.1 |
+| egotouch | 2,245 → 2,241 | 0 | 4 | ~0 |
+| wiyh (recon tier) | 757 → 744 | 0 | 13 | ~0 |
+| egoverse_aria (v1) | 156 → 156 (superseded by aria_v2) | 0 | 0 | 0 |
+
+Not in scope (validity is GT-derived or Stage-1 never required 2 hands): GT/native
+datasets (taco, hot3d, oakink, egodex, h2o, arctic, gigahands, humantouch, wiyh_native,
+EgoVerse natives), robot datasets. `egoverse_eva` had no Layer-4 output yet (conveyor
+in-flight; it inherits both gates). `egoexo4d` and `egoverse_mecka_freeform` ran with
+both gates from their first shard — verified across every shard report — so no retro
+purge was needed. `egoverse_aria_v2` had 18/19 shards filtered before the per-hand flag
+landed in the conveyor; it got the retro purge above.
+
+Verification: acceptance clips confirmed dropped
+(`factory013_worker005_00028_iv09` → 10k shard 01681 `single_valid_hand`;
+`factory_022_worker_097_0064_iv05` + `factory_065_worker_058_0089_iv10` → 100k shard
+02265 `empty_pose`); post-purge audits re-read `pred_valid` on fresh samples — 240-clip
+samples for the nine large datasets and full-coverage for wiyh (744/744) and
+egoverse_aria_v2 (fresh 240 after its purge) — all report **0 empty-pose and 0
+one-hand keeps**.
 
 ## Dropped datasets
 
