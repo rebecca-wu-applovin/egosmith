@@ -61,7 +61,7 @@ def mirror_pending(fs, ds: str, tag: str) -> int:
     return n_new
 
 
-def finalize(fs, ds: str, tag: str, source_hours: float | None):
+def finalize(fs, ds: str, tag: str, source_hours: float | None, fps_default: float = 30.0):
     tag_sfx = f".{tag}" if tag else ""
     pre = f"{BASE}/egosmith_filtered/{ds}"
     # concat converted + kept manifests, sum reports
@@ -75,7 +75,7 @@ def finalize(fs, ds: str, tag: str, source_hours: float | None):
                     continue
                 r = json.loads(l)
                 n = len(r["descriptor"].get("frame_names") or [])
-                fps = float(r["descriptor"].get("fps") or 30)
+                fps = float(r["descriptor"].get("fps") or fps_default)
                 conv_h += n / fps / 3600
                 conv_rows += 1
                 out.write(l + "\n")
@@ -89,7 +89,7 @@ def finalize(fs, ds: str, tag: str, source_hours: float | None):
                 continue
             r = json.loads(l)
             n = len(r["descriptor"].get("frame_names") or [])
-            fps = float(r["descriptor"].get("fps") or 30)
+            fps = float(r["descriptor"].get("fps") or fps_default)
             kept_h += n / fps / 3600
             kept_rows += 1
             kept_lines.append(l)
@@ -141,6 +141,7 @@ def main():
     ap.add_argument("--loop", type=int, default=0, help=">0: chase mode, poll every N sec")
     ap.add_argument("--finalize", action="store_true")
     ap.add_argument("--source_hours", type=float, default=None)
+    ap.add_argument("--fps_default", type=float, default=30.0)
     args = ap.parse_args()
     fs = gcsfs.GCSFileSystem()
     while True:
@@ -150,7 +151,7 @@ def main():
         print(f"[mirror] pass done (+{n}); sleeping {args.loop}s", flush=True)
         time.sleep(args.loop)
     if args.finalize:
-        finalize(fs, args.dataset, args.tag, args.source_hours)
+        finalize(fs, args.dataset, args.tag, args.source_hours, args.fps_default)
 
 
 if __name__ == "__main__":
