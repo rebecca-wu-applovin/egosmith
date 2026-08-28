@@ -98,10 +98,19 @@ ADAPTERS = {
     # unannotated keeps stay unlabeled until the labeling hold lifts)
     "egoexo4d": _ego_adapter("egoexo4d"),
     # GigaHands: EasyMocap bimanual MANO GT, use_gt mode (same render path as
-    # taco/h2o); native 30 fps; 11,542 kept / 27.47 h; annotations: NONE —
-    # published under the global labeling hold, cards render "annotation: null"
+    # taco/h2o); native 30 fps; annotations: NONE — published under the global
+    # labeling hold, cards render "annotation: null".
+    # 2026-08-28 ego trim: kept = first-person (head-position rig slot) clips only,
+    # per the (scene, camera-slot) audit (filter_run/ego_audit_20260828/); dropped
+    # non_egocentric_view tars live under _dropped_egotrim_20260828/frames/ and the
+    # dropped examples come from the explicit drop manifest below.
     "gigahands": dict(kind="cat3", fps=30.0, reconvert="gigahands",
-                      outputs=f"{BUCKET}/egosmith_recon/gigahands/use_gt/outputs"),
+                      outputs=f"{BUCKET}/egosmith_recon/gigahands/use_gt/outputs",
+                      dropped_manifest=f"{BUCKET}/egosmith_filtered/gigahands/filter_run/"
+                                       "clip_manifest.filtered.egotrimdropped.jsonl",
+                      dropped_frames=f"{BUCKET}/egosmith_filtered/gigahands/"
+                                     "_dropped_egotrim_20260828/frames",
+                      dropped_reason="non_egocentric_view"),
     # HaMeR-seeded recon (gloved hands); sharded ego layout + funnel stats
     "egotouch": _ego_adapter(
         "egotouch",
@@ -620,7 +629,11 @@ def render_dataset(ds, n, seed, work):
             fs.get(f"{ad['frames']}/shard_{s['shard']}/{cid}.tar", str(tar_local))
             seq = materialize_seq(f"{ad['recon']}/shard_{s['shard']}/{cid}", wdir / "_seq" / cid)
         elif ad["kind"] == "cat3":
-            gcs_tar = f"{BUCKET}/egosmith_filtered/{ds}/frames/{os.path.basename(d['shard_path'])}"
+            sp = d.get("shard_path") or ""
+            # absolute gs:// shard_path (e.g. sample_dropped_manifest rewrites dropped
+            # tars to _dropped_*/frames/) wins over the kept-frames mirror
+            gcs_tar = (sp.replace("gs://", "") if sp.startswith("gs://")
+                       else f"{BUCKET}/egosmith_filtered/{ds}/frames/{os.path.basename(sp)}")
             if fs.exists(gcs_tar):
                 fs.get(gcs_tar, str(tar_local))
             elif ad.get("reconvert") == "gigahands":  # kept-only mirror -> re-convert
@@ -987,7 +1000,7 @@ KEPT_HOURS = {
     "ego4d": 323.3, "holoassist": 49.9, "epic_kitchens_100": 26.6,
     "assembly101": 23.1, "hd_epic": 3.4, "egoverse_aria_v2": 7.71,
     "egodex": 464.6, "egotouch": 5.0, "wiyh": 2.01,
-    "gigahands": 27.47, "egoexo4d": 39.81,
+    "gigahands": 4.24, "egoexo4d": 39.81,
     # post-remediation (ab99d40): funnel hours_kept — 50,475 clips / 125.2 h
     "humantouch": 125.2,
     "dexycb": 4.36, "show3d": 24.82, "hoi4d": 3.59, "taco": 2.72,

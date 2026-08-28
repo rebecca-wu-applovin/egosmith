@@ -38,14 +38,14 @@ egosmith_filtered/
 | oakink_actions | 2,488 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | egodex | 158,564 | native — GT read straight from the tar | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` + `.gt_joints.npy` |
 | h2o | 149 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
-| gigahands | 11,542 (27.47 h) | `use_gt` — EasyMocap bimanual MANO GT + per-scene calib → `world_space_res.pth` (probe 1.6–2.1 mm) | `.image.jpg` |
+| gigahands | 2,076 (4.24 h, first-person views only; ego trim 2026-08-28) | `use_gt` — EasyMocap bimanual MANO GT + per-scene calib → `world_space_res.pth` (probe 1.6–2.1 mm) | `.image.jpg` |
 | wiyh_native | 440 (1.16 h, 12 sessions; post strict-audit remediation 2026-08-28) | native (TAGGED) — 25-joint glove GT via per-session anchor solve | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (with per-frame `gate_px`) + `.gt_joints.npy` (frames_v2) |
 | humantouch | 50,475 (125.2 h) | `gt_derived_extrinsic_block_anchor` — MANUS glove GT staged to MANO; camera extrinsic per mount-cluster from 118 vision-annotated anchors (4.5° assignment cap post-remediation, gated propagation) → `world_space_res.pth` | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
 | egoverse_mecka_freeform | 56,365 (785.9 h) | recon — HaWoR conveyor (456w/15fps, anycalib, Phase-D with BOTH presence gates) | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
-| egoverse_mecka_flagship | 45,224 (97.6 h) | native — in-zarr 21-kpt GT (convention A) → 116-d lowdim; frames = in-zarr 640×360 JPEGs | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (sharded `frames/shard_XXXXX/`) |
-| egoverse_lightwheel | 25,462 (43.5 h) | native — pose.json 21-kpt world + wrist quat through per-frame R_w2c + undistorted K (1920×1456) | same native payload (sharded) |
-| egoverse_microagi | 649,264 (1,658.2 h @29 fps) | native — in-zarr 21-kpt GT; annotations text-seeded (see caveat) | same native payload (sharded) |
-| egoverse_scale | 51,574 (140.8 h) | native — in-zarr 21-kpt GT; frames = in-zarr 640×480 JPEGs (`recenter_world` re-gauge applied) | same native payload (sharded) |
+| egoverse_mecka_flagship | 45,224 (97.6 h) | native — in-zarr 21-kpt GT (convention A) → 116-d lowdim; frames = in-zarr 640×360 JPEGs | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` + `.gt_joints.npy` `egoverse_world_21_mano_order_v1` (sharded `frames_v2/shard_XXXXX/`) |
+| egoverse_lightwheel | 25,462 (43.5 h) | native — pose.json 21-kpt world + wrist quat through per-frame R_w2c + undistorted K (1920×1456) | same native payload + `.gt_joints.npy` `lightwheel_world_21_mano_order_v1` (sharded `frames_v2/`) |
+| egoverse_microagi | 649,264 (1,658.2 h @29 fps) | native — in-zarr 21-kpt GT; annotations text-seeded (see caveat) | same native payload + `.gt_joints.npy` `egoverse_world_21_mano_order_v1` (sharded `frames_v2/`) |
+| egoverse_scale | 51,574 (140.8 h) | native — in-zarr 21-kpt GT; frames = in-zarr 640×480 JPEGs (`recenter_world` re-gauge applied) | same native payload + `.gt_joints.npy` `egoverse_world_21_mano_order_v1` (sharded `frames_v2/`) |
 | egoexo4d | 16,516 (39.81 h) | recon — HaWoR conveyor (aria ego RGB, kb4 undistort, 15fps; Phase-D with BOTH presence gates from the first shard) | `.image.jpg` (sharded; manifests in `filter_run/_shards/` + aggregated `clip_manifest.filtered.jsonl`) |
 
 H2O (ETH, ICCV 2021; egocentric cam4 only, 30 fps, two-hands+object tabletop manipulation;
@@ -63,6 +63,16 @@ filter with BOTH presence gates (`--min_presence_ratio 0.5
 without the presence gates and was never shipped (kept as
 `filter_run/filter_report.v1_no_presence_gates.json`). No annotations — shipped under
 the global labeling hold; see `filter_run/BUCKET_AUDIT.json` `annotation_status`.
+**Ego-only trim (2026-08-28):** 11,542 → **2,076 kept (4.24 h)**. GigaHands has no GoPro
+footage — "gopro" in scene names is the manipulated object; every clip is a static
+brics-odroid rig view. A per-(scene, camera-slot) frame audit of all 1,376 pairs
+(`filter_run/ego_audit_20260828/`) found 175 first-person pairs (camera at the
+participant's head position, e.g. `001_cam0/cam1` in every audited scene); the other
+9,466 clips (23.24 h) were dropped as `non_egocentric_view` — tars moved to
+`_dropped_egotrim_20260828/frames/`, reconciliation in
+`filter_run/egotrim_reconciliation.json`, pre-trim state in
+`filter_run/_preegotrim_backup_20260828/`. use_gt pose outputs remain untouched
+(view-independent; still cover the dropped clips).
 
 **WIYH native tier caveat (W7 locked-tier ingestion, 2026-08-28):** `wiyh_native` is a
 TAGGED approximate tier — every record carries `metadata.finger_quality =
@@ -252,6 +262,26 @@ an exact subset of `gt_joints` — validated per clip at conversion, max err 0.0
 (append-only rewrite of v1; original member bytes/offsets preserved verbatim, so
 `frame_offsets` stayed valid); the pre-retrofit manifest is backed up at
 `filter_run/_prev21_backup/`. Built by `scripts/build/retrofit_egodex_gt_joints.py`.
+
+**EgoVerse-native full-skeleton GT (`.gt_joints.npy`, retrofit 2026-08-28):** the four
+native tiers (egoverse_lightwheel / mecka_flagship / scale / microagi) shipped the same
+wrist+5-tips-only defect — the extractors read the full in-source 21-joint GT but only
+the 116-d lowdim survived. Every shipped tar was rewritten append-only into
+`frames_v2/shard_XXXXX/` with one `{frame}.gt_joints.npy` member per frame:
+**(2, 21, 3) float32** world-frame joints, MANO/OpenPose order (index 0 = left hand;
+wrist 0, tips 4/8/12/16/20). Schema tags: `egoverse_world_21_mano_order_v1` (zarr
+tiers), `lightwheel_world_21_mano_order_v1`; flag `extra["gt_joints"] = true`. An
+all-zero hand-frame is the untracked sentinel (`presence` in `.meta.json` stays
+authoritative); `.lowdim.npy` is unchanged and its wrist+tips are an exact subset of
+`gt_joints`, validated per clip on every presence-on frame (max err 0.0 across all
+771,524 clips). World-frame note: the fleet builds straddled the `recenter_world` spec
+change, so lightwheel ships 24,080 raw-world + 1,382 recentered clips (zarr tiers:
+recentered throughout) — the retrofit auto-detected the mode per clip against the
+clip's own lowdim, and `gt_joints` always matches the clip's lowdim/w2c world frame.
+Pre-retrofit manifests: `filter_run/_pre21_backup/` (combined + `_shards/`). The
+converter now emits `gt_joints` natively (`generate_keypoints_wds.py`), so future
+native builds carry the full skeletons from birth. Built by
+`scripts/build/retrofit_egoverse_gt_joints.py`.
 
 ### Out-of-scope prefixes (user decisions, 2026-08-27)
 - `taco-brush-allegro`, `taco-brush-sharpa`, `taco-overall-sharpa(-mirror)` — retargeted
