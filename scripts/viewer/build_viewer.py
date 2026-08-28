@@ -1001,8 +1001,9 @@ KEPT_HOURS = {
     "assembly101": 23.1, "hd_epic": 3.4, "egoverse_aria_v2": 7.71,
     "egodex": 464.6, "egotouch": 5.0, "wiyh": 2.01,
     "gigahands": 4.24, "egoexo4d": 39.81,
-    # post-remediation (ab99d40): funnel hours_kept — 50,475 clips / 125.2 h
-    "humantouch": 125.2,
+    # post full-tier screen + extended read (2026-08-29): funnel hours_kept —
+    # 47,265 clips / 117.21 h (funnel overrides this fallback anyway)
+    "humantouch": 117.21,
     "dexycb": 4.36, "show3d": 24.82, "hoi4d": 3.59, "taco": 2.72,
     "ho3d_v3": 0.68, "hot3d": 0.5, "oakink_actions": 6.63,
     "arctic": 1.61, "dexcap": 0.79, "h2o": 0.85,
