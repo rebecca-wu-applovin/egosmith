@@ -39,6 +39,12 @@ egosmith_filtered/
 | egodex | 158,564 | native — GT read straight from the tar | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` + `.gt_joints.npy` |
 | h2o | 149 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | wiyh_native | see `filter_run/BUCKET_AUDIT.json` | native (TAGGED) — 25-joint glove GT via per-session anchor solve | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (with per-frame `gate_px`) |
+| humantouch | 51,022 (126.6 h) | `gt_derived_extrinsic_block_anchor` — MANUS glove GT staged to MANO; camera extrinsic per mount-cluster from 118 vision-annotated anchors (7° fingerprint cover, gated propagation) → `world_space_res.pth` | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
+| egoverse_mecka_freeform | 56,365 (785.9 h) | recon — HaWoR conveyor (456w/15fps, anycalib, Phase-D with BOTH presence gates) | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
+| egoverse_mecka_flagship | 45,224 (97.6 h) | native — in-zarr 21-kpt GT (convention A) → 116-d lowdim; frames = in-zarr 640×360 JPEGs | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (sharded `frames/shard_XXXXX/`) |
+| egoverse_lightwheel | 25,462 (43.5 h) | native — pose.json 21-kpt world + wrist quat through per-frame R_w2c + undistorted K (1920×1456) | same native payload (sharded) |
+| egoverse_microagi | 649,264 (1,658.2 h @29 fps) | native — in-zarr 21-kpt GT; annotations text-seeded (see caveat) | same native payload (sharded) |
+| egoverse_scale | 51,574 (140.8 h) | native — in-zarr 21-kpt GT; frames = in-zarr 640×480 JPEGs (`recenter_world` re-gauge applied) | same native payload (sharded) |
 
 H2O (ETH, ICCV 2021; egocentric cam4 only, 30 fps, two-hands+object tabletop manipulation;
 built by `scripts/build/generate_h2o_world_res.py`, W9 2026-08-25): 184 sequences converted
@@ -66,6 +72,52 @@ disjoint method — that tier stays as-is); see `egosmith_filtered/wiyh_native/f
 video (raw-target projection proof; converter exonerated at 5.7–7.0 mm fit). Mask
 finger-level targets in training; wrist pose, video, and language annotations are reliable.
 Evidence: `egosmith_filtered/_audits/handedness_audit_2026-08-25/`.
+
+**HumanTouch caveats (ship 2026-08-28):** camera extrinsics are solved per
+mount-cluster from manual glove-landmark anchors (118 anchors, held-out validated,
+fit p50 ~25 px) — absolute world/camera-frame translation carries weak observability
+on ~18 clusters (bias up to ~0.2 m possible; rotation and reprojection consistency
+are validated; relative/articulated pose is glove-GT-grade). MANUS thumb-chain GT
+reprojects 60–100 px off across the dataset (glove-internal calibration) — treat
+thumb articulation as lower confidence. Per-clip provenance:
+`descriptor.extra.mount_block` + `block_fit_median_px`. Full details:
+`egosmith_filtered/humantouch/filter_run/FILTER_MODE.txt`; anchor evidence:
+`filter_run/anchor_audit/` + `filter_run/anchor_results/`. LLM annotations pending
+(key + budget re-approval).
+
+**EgoVerse ships (2026-08-28, five datasets):**
+- **mecka freeform/flagship dedup-by-construction:** 3,300 episode ids exist in BOTH
+  mecka subsets as the *same recording* (flagship mp4 = 320×180 downscale of the
+  freeform 960×540 video; frame-verified). The 3,292 GT-bearing + stage1-kept ones
+  ship ONCE, natively via `egoverse_mecka_flagship`, and were excluded from the
+  freeform recon reshard (2 ids fell in the gap — failed flagship Stage-1, ~0.05 h,
+  dropped). Do not concatenate the two datasets expecting disjoint recordings beyond
+  this rule; clip ids share the episode-id stem across both.
+- **flagship is native-only by measured verdict:** recon of the 320×180 mp4s is
+  degraded even with GT intrinsics injected (camera-frame hand MPJPE med ~96 mm vs
+  the 26–49 mm calibrated-regime baseline; persistent 0.7 pa_scale). Evidence:
+  `egosmith_filtered/_audits/mecka_flagship_320p_recon_smoke_2026-08-27/VERDICT.md`.
+  The GT-less ~47% of flagship *episodes* was dropped — measured at only 11.7 raw-h /
+  0.25 stage1-kept-h (avg 2.5 s episodes), see the same VERDICT + the census tool
+  `scripts/inspection/mecka_flagship_gt_census.py`.
+- **microagi annotations are text-seeded, not per-clip VLM:** 649,264 clips would cost
+  $1.5–2.5K to VLM-label; instead each of 246,468 unique in-zarr GT activity texts was
+  expanded ONCE (text-only gpt-5-mini) into level1–4 instructions and broadcast to its
+  clips ($61.56). Every row carries `"seeded_from": "in_zarr_text"`; level4 hand-centric
+  detail is generic (no frames were shown). QA: 256-clip independent VLM sample shows
+  80% content-token agreement on level1; disagreements are segmentation granularity,
+  not contradictions — evidence `_audits/microagi_text_seeded_qa_2026-08-28/`.
+- **Sub-100% annotation coverage (labeling hold):** a global labeling hold froze
+  top-ups; residual unannotated clips are freeform 19, flagship 19, lightwheel 11,
+  scale 55 (≤0.11% each; transient labeler errors, ids in
+  `filter_run/annotations_v4/_shards/*.errors.jsonl`). microagi is 100% (broadcast).
+- **egoverse_scale gauge note:** scale's raw world origin sits ~43 m from the camera;
+  lowdim was re-gauged per episode to the first-frame camera centre
+  (`recenter_world`, rigid translation — physics unchanged). World coordinates are
+  per-episode frames across ALL EgoVerse natives (as with EgoDex/ARKit).
+- Stage-1 interval gating: lightwheel and flagship converted only Stage-1 kept spans;
+  microagi/scale ran the on-pod Stage-1 prefilter (tuned `min_area 0.005`, `min_hands 1`
+  configs — production `min_area 0.02` kept 3/21 on the microagi pilot).
 
 ## Dropped datasets
 
