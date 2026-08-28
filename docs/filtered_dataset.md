@@ -40,7 +40,7 @@ egosmith_filtered/
 | h2o | 149 | `use_gt` — dataset GT MANO+camera → `world_space_res.pth` | `.image.jpg` |
 | gigahands | 2,076 (4.24 h, first-person views only; ego trim 2026-08-28) | `use_gt` — EasyMocap bimanual MANO GT + per-scene calib → `world_space_res.pth` (probe 1.6–2.1 mm) | `.image.jpg` |
 | wiyh_native | 440 (1.16 h, 12 sessions; post strict-audit remediation 2026-08-28) | native (TAGGED) — 25-joint glove GT via per-session anchor solve | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` (with per-frame `gate_px`) + `.gt_joints.npy` (frames_v2) |
-| humantouch | 50,475 (125.2 h) | `gt_derived_extrinsic_block_anchor` — MANUS glove GT staged to MANO; camera extrinsic per mount-cluster from 118 vision-annotated anchors (4.5° assignment cap post-remediation, gated propagation) → `world_space_res.pth` | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
+| humantouch | 47,265 (117.2 h) | `gt_derived_extrinsic_block_anchor` — MANUS glove GT staged to MANO; camera extrinsic per mount-cluster from 118 vision-annotated anchors (4.5° assignment cap post-remediation, gated propagation) → `world_space_res.pth` | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
 | egoverse_mecka_freeform | 56,365 (785.9 h) | recon — HaWoR conveyor (456w/15fps, anycalib, Phase-D with BOTH presence gates) | `.image.jpg` (sharded `frames/shard_XXXXX/`) |
 | egoverse_mecka_flagship | 45,224 (97.6 h) | native — in-zarr 21-kpt GT (convention A) → 116-d lowdim; frames = in-zarr 640×360 JPEGs | `.image.jpg` + `.lowdim.npy` + `.mano.npy` + `.meta.json` + `.gt_joints.npy` `egoverse_world_21_mano_order_v1` (sharded `frames_v2/shard_XXXXX/`) |
 | egoverse_lightwheel | 25,462 (43.5 h) | native — pose.json 21-kpt world + wrist quat through per-frame R_w2c + undistorted K (1920×1456) | same native payload + `.gt_joints.npy` `lightwheel_world_21_mano_order_v1` (sharded `frames_v2/`) |
@@ -148,6 +148,28 @@ visually off (bin-weighted 5.9%), a scattered per-episode mis-assignment long
 tail across 6 non-remediated blocks (inside the original audit's 0.2–9.3%
 band). Treat clip-level alignment as ~94% locked / ~6% off until a follow-up
 pass is approved; evidence `filter_run/ship_gate_qa_20260828/`.
+
+**HumanTouch full-tier screen (2026-08-29):** response to the gate FAIL — per-clip
+alignment metrics on all 50,475 clips (MANO GT vs dark-glove mask), rules R1–R7
+flagged 2,970 episodes; every flagged episode + a 5% unflagged sample was read
+visually twice with confirmation reads of every off call, then an extended 18.2%
+unflagged sample (2,444 episodes) was double-read the same way. Dropped (user-approved):
+**930 + 72 = 1,002 episodes = 3,210 clips = 8.0 h**, reason `full_screen_visual_off`
+(skeleton essentially not on the gloves). Post-drop tier: **47,265 clips / 117.2 h**.
+Reconciliations `filter_run/fullscreen_drop_20260829.json` +
+`filter_run/fullscreen_ext_20260829.json`; tars under
+`humantouch/_dropped_fullscreen_20260829/frames/`; backups
+`filter_run/_prescreen_backup_20260829/` + `filter_run/_preext_backup_20260829/`.
+Combined unflagged FN sample: 86/3,212 = **2.68%** confirmed off (Wilson 95%
+2.2–3.3%) — ~294 undetected off episodes plausibly remain among the 10,964 unread
+unflagged. **Gate result 2026-08-29: FAIL** — 10/100 visually off (weighted 10.0%
+vs 2% threshold; off-or-marginal 78.7% under a strict clip-level reading). 6 of the
+10 offs are grossly-elongated-but-anchored skeletons, a per-clip failure the episode
+screen deliberately classified marginal, so drops cannot fix it. Do NOT treat this
+tier as pixel-aligned: gate per clip on the audit metrics
+(`full_screen_20260828/episode_metrics.jsonl`, local) or use wrist-only image-space
+supervision; relative/articulated pose is glove-GT-grade and unaffected. Evidence
+`filter_run/ship_gate_qa_20260829/`.
 
 **EgoVerse ships (2026-08-28, five datasets):**
 - **mecka freeform/flagship dedup-by-construction:** 3,300 episode ids exist in BOTH
