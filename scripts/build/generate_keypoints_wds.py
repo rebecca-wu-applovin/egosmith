@@ -171,6 +171,10 @@ def _fill_missing_hand(t, R, tips, valid, w2c):
 # --------------------------------------------------------------------------------------
 
 def _gsutil(args, **kw):
+    # hard timeout: a single hung gsutil (observed on the lightwheel fleet: pod wedged
+    # >2 h in convert) otherwise blocks its worker forever — the episode fails instead
+    # and is retried by the next pod via skip-if-done.
+    kw.setdefault("timeout", 1800)
     return subprocess.run(["gsutil", "-q"] + args, check=True, capture_output=True, **kw)
 
 
