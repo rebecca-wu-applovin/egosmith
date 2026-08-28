@@ -482,15 +482,23 @@ def run_flip(a, cfg):
         print(f"[flip] combined backup -> {bkp}")
     else:
         print(f"[flip] combined backup already present: {bkp}")
+    # invalidate gcsfs's dircache: the shard objects were just rewritten LONGER by the
+    # pool workers, and a stale cached size truncates the streamed reads mid-record
+    # (observed 2026-08-28: ~6 records lost per shard + one glued line per boundary)
+    fs.invalidate_cache()
+    n_out = 0
     with fs.open(comb, "wb") as out:
         for s in shards:
-            with fs.open(s, "rb") as f:
-                while True:
-                    chunk = f.read(64 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-    print(f"[flip] combined regenerated from {len(shards)} flipped shards")
+            data = fs.cat(s)
+            if not data.endswith(b"\n"):
+                raise ValueError(f"flipped shard {s} lacks trailing newline")
+            n_out += data.count(b"\n")
+            out.write(data)
+    print(f"[flip] combined regenerated from {len(shards)} flipped shards "
+          f"({n_out} records)")
+    if cfg["expected_clips"] and n_out != cfg["expected_clips"]:
+        print(f"[flip] ERROR: combined has {n_out} records != {cfg['expected_clips']}")
+        return 1
     return 0
 
 
