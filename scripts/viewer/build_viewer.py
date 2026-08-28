@@ -89,9 +89,19 @@ ADAPTERS = {
     "epic_kitchens_100": _ego_adapter("epic_kitchens_100"),
     "holoassist": _ego_adapter("holoassist"),
     "ego4d": _ego_adapter("ego4d"),
-    # 96/153 shards kept 0 clips post presence gating -> few kept clips per
-    # non-empty shard; widen the shard fan-out so n=50 kept cards materialize
-    "egoverse_aria": _ego_adapter("egoverse_aria", shards_k=40),
+    # egoverse_aria v1 REPLACED by egoverse_aria_v2 (see egosmith_filtered/
+    # egoverse_aria/REPLACED.md): full Layer-1-first rerun, Stage-1 interval trim,
+    # fresh recon; 6,802 kept sub-clips / 7.71 h post presence re-filter
+    "egoverse_aria_v2": _ego_adapter("egoverse_aria_v2"),
+    # egoexo4d: standard ego conveyor (aria RGB, kb4 undistort), 86/86 shards;
+    # 16,516 kept / 39.81 h; 16,139 annotation rows merged pre-hold (the 377
+    # unannotated keeps stay unlabeled until the labeling hold lifts)
+    "egoexo4d": _ego_adapter("egoexo4d"),
+    # GigaHands: EasyMocap bimanual MANO GT, use_gt mode (same render path as
+    # taco/h2o); native 30 fps; 11,542 kept / 27.47 h; annotations: NONE —
+    # published under the global labeling hold, cards render "annotation: null"
+    "gigahands": dict(kind="cat3", fps=30.0, reconvert="gigahands",
+                      outputs=f"{BUCKET}/egosmith_recon/gigahands/use_gt/outputs"),
     # HaMeR-seeded recon (gloved hands); sharded ego layout + funnel stats
     "egotouch": _ego_adapter(
         "egotouch",
@@ -126,7 +136,9 @@ ADAPTERS = {
                  frames=f"{BUCKET}/egosmith_filtered/wiyh/frames",
                  recon=f"{BUCKET}/egosmith_recon/wiyh/recon/outputs",
                  funnel=f"{BUCKET}/egosmith_filtered/wiyh/filter_run/funnel.json",
-                 shards_k=60),
+                 # keeps are sparse (~14% of 686 shards non-empty): scan them all so
+                 # ~50 kept cards materialize (the old shards_k=60 yielded only 8)
+                 shards_k=700),
     # HumanTouch: MANUS glove GT + block-anchor extrinsics; cards produced by
     # scripts/viewer/build_humantouch_cards.py (external cards.json, publish-only);
     # single annotations.v4.jsonl like wiyh
@@ -171,12 +183,14 @@ ADAPTERS = {
 # see egosmith_filtered/<ds>/DROPPED.md). The root builder skips them even if stale
 # viewer objects resurface.
 DROPPED = {
-    "assemblyhands",  # user-ordered drop 2026-08-26: data-quality concerns
+    "assemblyhands",   # user-ordered drop 2026-08-26: data-quality concerns
+    "egoverse_aria",   # v1 REPLACED by egoverse_aria_v2 2026-08-27 (REPLACED.md)
 }
 CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric (recon)",
             "dexycb": "Cat-3 GT", "ho3d_v3": "Cat-3 GT", "show3d": "Cat-3 GT",
             "hoi4d": "Cat-3 GT", "taco": "Cat-3 GT", "oakink_actions": "Cat-3 GT",
             "hot3d": "Cat-3 GT", "arctic": "Cat-3 GT", "h2o": "Cat-3 GT",
+            "gigahands": "Cat-3 GT",
             "egodex": "Cat-2 native GT (Vision Pro 21-joint)",
             "dexcap": "Cat-2 GT (glove→MANO)",
             "humantouch": "Cat-2 GT (MANUS glove→MANO, anchor extrinsics)",
@@ -186,7 +200,8 @@ CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric
             # Cat-1, fully processed (recon overlays + v4 annotations)
             "assembly101": "Cat-1 (recon)", "hd_epic": "Cat-1 (recon)",
             "holoassist": "Cat-1 (recon)", "ego4d": "Cat-1 (recon)",
-            "epic_kitchens_100": "Cat-1 (recon)", "egoverse_aria": "Cat-1 (recon)",
+            "epic_kitchens_100": "Cat-1 (recon)", "egoverse_aria_v2": "Cat-1 (recon)",
+            "egoexo4d": "Cat-1 (recon)",
             "egoverse_mecka_freeform": "Cat-1 (recon)",
             "egoverse_mecka_flagship": "EgoVerse native GT (21-joint)",
             "egoverse_lightwheel": "EgoVerse native GT (21-joint)",
@@ -256,29 +271,48 @@ def sample_ego(ds, ad, n, seed, shards_k=10):
     return out[:n]
 
 
+PURGE_TAG = "presence re-filter"
+
+
 def sample_dropped_ego(ds, ad, n, seed):
     """Sample DROPPED clips (with reasons) from per-shard filter reports; descriptors
-    come from the phaseB manifest (dropped clips are absent from filtered.jsonl)."""
+    come from the phaseB manifest (dropped clips are absent from filtered.jsonl).
+
+    Also surfaces the 2026-08-27 presence re-filter purge (empty_pose /
+    single_valid_hand), recorded per shard under report['presence_refilter']
+    ['clip_ids']: up to 2 examples per purge reason, on top of the n quality drops.
+    Purged clips render through the normal path — their frames tars and recon
+    outputs were never deleted, only the manifest/annotation rows were pruned."""
     rng = random.Random(seed + 1)
     pb = ad["filt"].replace("/filter_run/_shards", "/phaseB/_shards")
     reports = [p for p in fs.ls(ad["filt"]) if p.endswith(".report.json")]
     out, seen_reasons = [], {}
+    purge_left = {"empty_pose": 2, "single_valid_hand": 2}
+    n_quality = 0
     for rp in rng.sample(reports, min(12, len(reports))):
-        if len(out) >= n:
+        if n_quality >= n and not any(purge_left.values()):
             break
         rep = json.loads(fs.open(rp, "rb").read())
-        dropped = [d for d in rep.get("dropped", []) if d.get("drop_category") == "quality"]
-        rng.shuffle(dropped)
         sfx = os.path.basename(rp).split(".")[0].replace("shard_", "")
         picked = []
-        for d in dropped:  # spread across distinct primary reasons
-            key = (d.get("reasons") or ["?"])[0]
-            if seen_reasons.get(key, 0) >= max(2, n // 5):
-                continue
-            seen_reasons[key] = seen_reasons.get(key, 0) + 1
-            picked.append(d)
-            if len(picked) >= 2:
-                break
+        if n_quality < n:
+            dropped = [d for d in rep.get("dropped", []) if d.get("drop_category") == "quality"]
+            rng.shuffle(dropped)
+            for d in dropped:  # spread across distinct primary reasons
+                key = (d.get("reasons") or ["?"])[0]
+                if seen_reasons.get(key, 0) >= max(2, n // 5):
+                    continue
+                seen_reasons[key] = seen_reasons.get(key, 0) + 1
+                picked.append(d)
+                if len(picked) >= 2:
+                    break
+        pr = (rep.get("presence_refilter") or {}).get("clip_ids") or {}
+        for reason in ("empty_pose", "single_valid_hand"):
+            ids = pr.get(reason) or []
+            take = min(purge_left.get(reason, 0), len(ids), 1)  # <=1/shard: spread out
+            for cid in rng.sample(ids, take):
+                picked.append({"clip_id": cid, "reasons": [f"{reason} ({PURGE_TAG})"]})
+                purge_left[reason] -= 1
         if not picked:
             continue
         by_id = {d["clip_id"]: d for d in picked}
@@ -289,7 +323,39 @@ def sample_dropped_ego(ds, ad, n, seed):
             if r["clip_id"] in by_id:
                 out.append(dict(rec=r, ann=None, shard=sfx,
                                 reasons=by_id[r["clip_id"]].get("reasons", [])))
-    return out[:n]
+        n_quality = sum(1 for o in out
+                        if not any(PURGE_TAG in x for x in o["reasons"]))
+    if any(purge_left.values()):
+        # sparse purges (e.g. wiyh: 13 clips over 686 shards) rarely land in the 12
+        # sampled reports — top up from the reconciliation file, which indexes the
+        # purged clip_ids per shard
+        rec_path = ad["filt"].replace("/_shards", "/presence_refilter_reconciliation.json")
+        if fs.exists(rec_path):
+            shards_w = [sh for sh in
+                        json.loads(fs.open(rec_path, "rb").read()).get("shards", [])
+                        if any((sh.get("clip_ids") or {}).get(r) for r in purge_left)]
+            rng.shuffle(shards_w)
+            for sh in shards_w[:6]:
+                if not any(purge_left.values()):
+                    break
+                sfx = sh["shard"]
+                by_id = {}
+                for reason in ("empty_pose", "single_valid_hand"):
+                    ids = (sh.get("clip_ids") or {}).get(reason) or []
+                    for cid in rng.sample(ids, min(purge_left.get(reason, 0), len(ids), 1)):
+                        by_id[cid] = [f"{reason} ({PURGE_TAG})"]
+                        purge_left[reason] -= 1
+                if not by_id:
+                    continue
+                for line in fs.open(f"{pb}/shard_{sfx}.manifest.jsonl",
+                                    "rb").read().decode().splitlines():
+                    if not line.strip():
+                        continue
+                    r = json.loads(line)
+                    if r["clip_id"] in by_id:
+                        out.append(dict(rec=r, ann=None, shard=sfx,
+                                        reasons=by_id[r["clip_id"]]))
+    return out[:n + 4]
 
 
 def sample_dropped_native(ds, ad, n, seed):
@@ -375,6 +441,41 @@ def _reconvert_native_tar(ds, s, tar_local, wdir):
             got = sum(1 for m in tf.getnames() if m.endswith(".image.jpg"))
         if got != want:
             raise RuntimeError(f"reconvert segmentation drift: {got} frames != {want}")
+    shutil.move(str(src), str(tar_local))
+    shutil.rmtree(tmp, ignore_errors=True)
+    return tar_local
+
+
+def _reconvert_gigahands_tar(s, tar_local, wdir):
+    """GigaHands frames/ mirrors KEPT tars only, so dropped-example tars are
+    re-converted on demand from the raw capture on the bucket (the converter streams
+    per-sequence via --include <scene>/<seq>). use_gt outputs for dropped clips still
+    exist on the bucket, so the overlay renders through the normal cat3 path."""
+    import shutil
+    cid = s["rec"]["clip_id"]
+    ex = s["rec"]["descriptor"].get("extra") or {}
+    scene, seq = ex.get("scene"), ex.get("gigahands_seq")
+    if not scene or seq is None:
+        raise FileNotFoundError(f"{cid}: no scene/seq in descriptor.extra")
+    tmp = wdir / "_reconv" / cid
+    tmp.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable,
+           str(_REPO / "scripts" / "build" / "generate_gigahands_world_res.py"),
+           "--frames_root", str(tmp / "frames"), "--outputs_root", str(tmp / "outputs"),
+           "--manifest_out", str(tmp / "manifest.jsonl"),
+           "--cache_dir", str(tmp / "_cache"), "--work_dir", str(tmp / "_work"),
+           "--workers", "1", "--include", f"{scene}/{seq}"]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
+    src = tmp / "frames" / f"{cid}.tar"
+    if not src.exists():
+        raise FileNotFoundError(f"reconvert produced no {cid}.tar")
+    want = len(s["rec"]["descriptor"].get("frame_names") or [])
+    if want:
+        import tarfile
+        with tarfile.open(src) as tf:
+            got = sum(1 for m in tf.getnames() if m.endswith(".image.jpg"))
+        if got != want:
+            raise RuntimeError(f"reconvert frame drift: {got} != {want}")
     shutil.move(str(src), str(tar_local))
     shutil.rmtree(tmp, ignore_errors=True)
     return tar_local
@@ -519,8 +620,13 @@ def render_dataset(ds, n, seed, work):
             fs.get(f"{ad['frames']}/shard_{s['shard']}/{cid}.tar", str(tar_local))
             seq = materialize_seq(f"{ad['recon']}/shard_{s['shard']}/{cid}", wdir / "_seq" / cid)
         elif ad["kind"] == "cat3":
-            fs.get(f"{BUCKET}/egosmith_filtered/{ds}/frames/{os.path.basename(d['shard_path'])}",
-                   str(tar_local))
+            gcs_tar = f"{BUCKET}/egosmith_filtered/{ds}/frames/{os.path.basename(d['shard_path'])}"
+            if fs.exists(gcs_tar):
+                fs.get(gcs_tar, str(tar_local))
+            elif ad.get("reconvert") == "gigahands":  # kept-only mirror -> re-convert
+                _reconvert_gigahands_tar(s, tar_local, wdir)
+            else:
+                fs.get(gcs_tar, str(tar_local))  # surface the original error
             seq = materialize_seq(f"{ad['outputs']}/{cid}", wdir / "_seq" / cid)
         elif "filt" in ad:  # sharded native GT: frames/shard_XXXXX/<cid>.tar
             gcs_tar = f"{ad['frames']}/shard_{s['shard']}/{cid}.tar"
@@ -868,10 +974,17 @@ def root_html(rows, totals=None):
 # Sources: funnels (100k/10k/egotouch/wiyh), the Cat-1 conveyor completion report,
 # per-manifest frame/fps sums (Cat-3, robots from QC reports).
 KEPT_HOURS = {
-    "egocentric100k": 24960, "egocentric10k": 2622,
-    "ego4d": 335.3, "holoassist": 50.3, "epic_kitchens_100": 26.8,
-    "assembly101": 23.5, "hd_epic": 3.5, "egoverse_aria": 5.9,
-    "egodex": 464.6, "egotouch": 5.0, "wiyh": 2.04,
+    # 2026-08-28 refresh: post presence-re-filter values. 100k/10k/egotouch/wiyh
+    # come from refreshed funnel.json (funnel overrides these anyway); the Cat-1
+    # conveyor datasets have no funnel.json — values below = pre-purge hours minus
+    # presence_refilter_reconciliation.json removed_hours.
+    "egocentric100k": 24687.3, "egocentric10k": 2590.6,
+    "ego4d": 323.3, "holoassist": 49.9, "epic_kitchens_100": 26.6,
+    "assembly101": 23.1, "hd_epic": 3.4, "egoverse_aria_v2": 7.71,
+    "egodex": 464.6, "egotouch": 5.0, "wiyh": 2.01,
+    "gigahands": 27.47, "egoexo4d": 39.81,
+    # post-remediation (ab99d40): funnel hours_kept — 50,475 clips / 125.2 h
+    "humantouch": 125.2,
     "dexycb": 4.36, "show3d": 24.82, "hoi4d": 3.59, "taco": 2.72,
     "ho3d_v3": 0.68, "hot3d": 0.5, "oakink_actions": 6.63,
     "arctic": 1.61, "dexcap": 0.79, "h2o": 0.85,
@@ -889,7 +1002,9 @@ def dataset_kept_hours(ds, ad):
         fp = (ad or {}).get("funnel") or f"{BUCKET}/egosmith_filtered/{ds}/filter_run/funnel.json"
         if fs.exists(fp):
             fn = json.loads(fs.open(fp, "rb").read())
-            h = fn.get("final_hours", fn.get("final_kept_hours", fn.get("kept_hours")))
+            # hours_kept: humantouch remediation funnel spelling (2026-08-28)
+            h = fn.get("final_hours", fn.get("final_kept_hours",
+                fn.get("kept_hours", fn.get("hours_kept"))))
             if h:
                 return float(h)
     except Exception:  # noqa: BLE001
