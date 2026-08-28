@@ -115,11 +115,24 @@ ADAPTERS = {
                  recon=f"{BUCKET}/egosmith_recon/wiyh/recon/outputs",
                  funnel=f"{BUCKET}/egosmith_filtered/wiyh/filter_run/funnel.json",
                  shards_k=60),
+    # HumanTouch: MANUS glove GT + block-anchor extrinsics; cards produced by
+    # scripts/viewer/build_humantouch_cards.py (external cards.json, publish-only);
+    # single annotations.v4.jsonl like wiyh
+    "humantouch": dict(kind="ego", fps=15.0,
+                       ann_file=f"{BUCKET}/egosmith_filtered/humantouch/filter_run/annotations.v4.jsonl",
+                       frames=f"{BUCKET}/egosmith_filtered/humantouch/frames",
+                       funnel=f"{BUCKET}/egosmith_filtered/humantouch/filter_run/funnel.json"),
     # hot3d ships pre-rendered viz/*.overlay.mp4 — copy, don't re-render
     "hot3d": dict(kind="hot3d_viz"),
     # native lowdim (Vision Pro GT); full 21-joint skeletons pulled per clip from the
     # raw EgoDex hdf5s (ranged zip reads, egodex_rawgt.py) — lowdim carries only 6 pts
     "egodex": dict(kind="native", fps=30.0, raw_gt="egodex"),
+    # EgoVerse 2026-08-28 ships: freeform = recon conveyor; the rest = native GT
+    "egoverse_mecka_freeform": _ego_adapter("egoverse_mecka_freeform"),
+    "egoverse_mecka_flagship": dict(kind="native", fps=30.0),
+    "egoverse_lightwheel": dict(kind="native", fps=30.0),
+    "egoverse_microagi": dict(kind="native", fps=29.0),
+    "egoverse_scale": dict(kind="native", fps=30.0),
     # WIYH native tier: 25-joint glove GT via per-session anchor solve; tagged
     # finger_quality=approximate_35_65px (see egosmith_filtered/wiyh_native/FILTER_MODE.txt)
     "wiyh_native": dict(kind="native", fps=10.0),
@@ -137,6 +150,7 @@ CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric
             "hot3d": "Cat-3 GT", "arctic": "Cat-3 GT", "h2o": "Cat-3 GT",
             "egodex": "Cat-2 native GT (Vision Pro 21-joint)",
             "dexcap": "Cat-2 GT (glove→MANO)",
+            "humantouch": "Cat-2 GT (MANUS glove→MANO, anchor extrinsics)",
             # Cat-4 robot datasets (video-only cards, external adapter)
             "trex": "Cat-4 robot", "dexora": "Cat-4 robot", "dexwild": "Cat-4 robot",
             "hrdexdb_allegro": "Cat-4 robot", "realdex": "Cat-4 robot",
@@ -144,6 +158,11 @@ CATEGORY = {"egocentric100k": "Egocentric (recon)", "egocentric10k": "Egocentric
             "assembly101": "Cat-1 (recon)", "hd_epic": "Cat-1 (recon)",
             "holoassist": "Cat-1 (recon)", "ego4d": "Cat-1 (recon)",
             "epic_kitchens_100": "Cat-1 (recon)", "egoverse_aria": "Cat-1 (recon)",
+            "egoverse_mecka_freeform": "Cat-1 (recon)",
+            "egoverse_mecka_flagship": "EgoVerse native GT (21-joint)",
+            "egoverse_lightwheel": "EgoVerse native GT (21-joint)",
+            "egoverse_microagi": "EgoVerse native GT (21-joint)",
+            "egoverse_scale": "EgoVerse native GT (21-joint)",
             "egotouch": "Cat-1 (seeded recon, gloved hands)",
             "wiyh": "Cat-2 (recon, exoskeleton hands — 0.37% keep)",
             "wiyh_native": "Cat-2 native GT (25-joint glove, approx 35-65px fingers)"}
