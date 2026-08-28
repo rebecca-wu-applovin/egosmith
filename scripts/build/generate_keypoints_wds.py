@@ -28,6 +28,22 @@ Each extractor returns a normalized ``EpisodeData`` dict (all world-frame, meter
                                | dict(mode="placeholder", width=, height=)
   task / desc                  strings for the manifest
 
+Optional full-skeleton GT (extractors whose source carries the complete per-frame
+joint set, not just wrist+tips):
+
+  ljoints / rjoints (T,J,3)    full world-frame joint positions per hand (raw source
+                               values; an untracked hand-frame stays all-zero)
+  gt_joints_schema             tag describing J + joint order, e.g.
+                               "egoverse_world_21_mano_order_v1"
+
+When present, the writer emits one ``{frame}.gt_joints.npy`` member per frame — a
+``(2, J, 3)`` float32 array (index 0 = left hand; all-zero hand-frame = untracked,
+``.meta.json`` presence stays authoritative) — and the manifest record carries
+``extra.gt_joints = True`` + ``extra.gt_joints_schema``. This is the fix for the
+2026-08 EgoVerse-native defect where the extractors read the full 21-joint GT but
+only wrist+5-tips survived into the shipped tars (same defect retrofitted twice
+before: egodex, wiyh_native).
+
 Missing-hand convention (motion/camera-space gates in quality/accumulator.py are
 presence-blind, so raw zeros would fake >9 m/s glitches):
   * presence bit is OFF for every invalid frame (the filter's projection gates skip
@@ -522,6 +538,8 @@ class EgoverseZarr3Extractor:
             lw_R=_quat_to_rotmat(lw[:, 3:7], self.quat_order),
             rw_R=_quat_to_rotmat(rw[:, 3:7], self.quat_order),
             ltips=lk[:, self.tip_idx], rtips=rk[:, self.tip_idx],
+            ljoints=lk, rjoints=rk,
+            gt_joints_schema="egoverse_world_21_mano_order_v1",
             valid_l=valid_l, valid_r=valid_r,
             w2c=w2c, intr=intr, fps=fps,
             frames=frames, extra=extra,
@@ -608,6 +626,8 @@ class LightwheelPoseJsonExtractor:
             lw_t=lk[:, 0], rw_t=rk[:, 0],
             lw_R=_quat_to_rotmat(lq, "wxyz"), rw_R=_quat_to_rotmat(rq, "wxyz"),
             ltips=lk[:, self.tip_idx], rtips=rk[:, self.tip_idx],
+            ljoints=lk, rjoints=rk,
+            gt_joints_schema="lightwheel_world_21_mano_order_v1",
             valid_l=valid_l, valid_r=valid_r,
             w2c=w2c, intr=intr, fps=30.0,
             frames=dict(mode="mp4", path=str(work / "video.mp4")),
@@ -1157,16 +1177,22 @@ def _slice_ep(ep: dict, s: int, e: int) -> dict:
     out = dict(ep)
     for k in ("lw_t", "rw_t", "lw_R", "rw_R", "ltips", "rtips", "valid_l", "valid_r", "w2c"):
         out[k] = ep[k][s:e]
+    for k in ("ljoints", "rjoints"):
+        if ep.get(k) is not None:
+            out[k] = ep[k][s:e]
     if ep.get("frame_meta") is not None:
         out["frame_meta"] = ep["frame_meta"][s:e]
     return out
 
 
-def _write_clip_tar(sub_id, jpgs, lowdim, presence, frames_root, outputs_root, frame_meta=None):
+def _write_clip_tar(sub_id, jpgs, lowdim, presence, frames_root, outputs_root, frame_meta=None,
+                    gt_joints=None):
     """Write one sub-clip tar (template layout) and return sorted (frame_names, offsets).
 
     frame_meta: optional per-frame dicts merged into each .meta.json next to "presence"
-    (e.g. WIYH per-frame wrist-gate pixel codes)."""
+    (e.g. WIYH per-frame wrist-gate pixel codes).
+    gt_joints: optional (T,2,J,3) float32 full-skeleton world GT -> one
+    {frame}.gt_joints.npy member per frame."""
     tar_path = Path(frames_root) / f"{sub_id}.tar"
     (Path(outputs_root) / sub_id).mkdir(parents=True, exist_ok=True)
     mano = np.zeros((2, 55), np.float32)
@@ -1175,7 +1201,10 @@ def _write_clip_tar(sub_id, jpgs, lowdim, presence, frames_root, outputs_root, f
         for t in range(len(jpgs)):
             key = f"{sub_id}_f{t:05d}"
             members = [(f"{key}.image.jpg", jpgs[t])]
-            for suffix, arr in ((".lowdim.npy", lowdim[t]), (".mano.npy", mano)):
+            arrays = [(".lowdim.npy", lowdim[t]), (".mano.npy", mano)]
+            if gt_joints is not None:
+                arrays.append((".gt_joints.npy", gt_joints[t]))
+            for suffix, arr in arrays:
                 buf = io.BytesIO(); np.save(buf, arr)
                 members.append((f"{key}{suffix}", buf.getvalue()))
             meta = {"presence": int(presence[t])}
@@ -1221,6 +1250,12 @@ def convert_episode(episode_ref: str, spec: dict, args) -> list[dict]:
                 ep[k] = ep[k] - C0
             for k in ("ltips", "rtips"):
                 ep[k] = ep[k] - C0
+            # full-skeleton GT shifts identically, but all-zero rows are the
+            # "untracked hand-frame" sentinel and must stay zero
+            for jk, vk in (("ljoints", "valid_l"), ("rjoints", "valid_r")):
+                if ep.get(jk) is not None:
+                    ep[jk] = np.where(np.asarray(ep[vk], bool)[:, None, None],
+                                      ep[jk] - C0, ep[jk])
             w2c = ep["w2c"].copy()
             w2c[:, :3, 3] = w2c[:, :3, 3] + np.einsum("tij,j->ti", w2c[:, :3, :3], C0)
             ep["w2c"] = w2c
@@ -1286,13 +1321,23 @@ def convert_episode(episode_ref: str, spec: dict, args) -> list[dict]:
             lowdim, presence = _build_lowdim(
                 sub_ep, e - s, image_size=image_size,
                 presence_requires_projection=bool(spec.get("presence_requires_projection", False)))
+            gtj = None
+            if ep.get("ljoints") is not None and ep.get("rjoints") is not None:
+                gtj = np.stack([sub_ep["ljoints"], sub_ep["rjoints"]],
+                               axis=1).astype(np.float32)  # (T,2,J,3)
+                if not np.isfinite(gtj).all():
+                    raise ValueError("non-finite full-skeleton GT joints")
             fn, fo = _write_clip_tar(sub_id, jpgs[s:e], lowdim, presence,
                                      args.frames_root, args.outputs_root,
-                                     frame_meta=sub_ep.get("frame_meta"))
+                                     frame_meta=sub_ep.get("frame_meta"),
+                                     gt_joints=gtj)
+            gt_extra = ({"gt_joints": True,
+                         "gt_joints_schema": ep["gt_joints_schema"]}
+                        if gtj is not None else {})
             r = {"episode": episode_ref, "status": "ok", "clip_id": sub_id,
                  "frames": e - s, "task": ep.get("task", ""), "desc": ep.get("desc", ""),
                  "fps": fps, "presence_ratio": float((presence > 0).mean()),
-                 "extra": {**ep.get("extra", {}),
+                 "extra": {**ep.get("extra", {}), **gt_extra,
                            **({"session_id": clip_id, "segment_index": k,
                                "segment_frame_range": [int(s), int(e)],
                                "segment_sec": float(args.segment_sec)} if segmented else {})},
