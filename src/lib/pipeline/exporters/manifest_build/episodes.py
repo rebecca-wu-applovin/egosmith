@@ -449,6 +449,12 @@ def compute_descriptor_episode_quality_metrics(
 
 
 def _load_descriptor_image_size(descriptor) -> tuple[int, int]:
+    # Fast path: use known descriptor dims (fixed per egocentric camera) and skip the
+    # frame read — lets the filter run without the frame tars present locally.
+    w = getattr(descriptor, "width", None)
+    h = getattr(descriptor, "height", None)
+    if w and h and int(w) > 0 and int(h) > 0:
+        return int(w), int(h)
     read_frame_bytes = build_frame_bytes_reader(descriptor)
     first_frame_bytes = read_frame_bytes(0)
     with Image.open(io.BytesIO(first_frame_bytes)) as image:

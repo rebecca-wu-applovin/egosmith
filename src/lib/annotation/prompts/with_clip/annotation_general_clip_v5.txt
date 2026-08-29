@@ -1,0 +1,151 @@
+# Video Annotation Task: General Egocentric Action Segmentation and Description
+
+## Objective
+Segment the input egocentric or close hand-centered video into meaningful hand-object action clips. For each valid segment, provide a precise 5-level language description of the visible manipulation.
+
+## Content Scope
+The video may contain daily activities, tool use, object handling, cooking, cleaning, repair, assembly, organization, inspection, scanning, or other practical manipulation tasks.
+
+## Segmentation Procedure
+Apply these steps in order:
+
+1. **Short video check.** If the stated video duration is under 4 seconds, return exactly ONE segment spanning the whole video (start = 0, end = video duration), describing the main manipulation. Never split a video shorter than 4 seconds. Skip the remaining steps.
+2. **Find every distinct manipulation.** A distinct manipulation is active hand-object interaction with one main object and one goal. Exclude walking, camera transitions, scene scanning, passive observation, talking, reading, waiting, or hands resting without manipulating an object.
+3. **Merge same-object motions.** Consecutive motions on the same object(s) — reaching, grasping, lifting, using, repositioning, releasing — form ONE segment, not several. Never place a boundary at the grasp or at the release. Start a new segment only when the main manipulated object or the manipulation goal changes.
+4. **Cover every manipulation.** After merging, every distinct manipulation found in step 2 must be inside exactly one segment. Do not drop a manipulation because it is brief or because a nearby segment already exists: if it involves a different object or goal, it gets its own segment.
+5. **Check segment lengths.** Each segment must be 3 to 10 seconds. A segment's time span covers the full motion arc — the reach toward the object, the manipulation, and the release or hand retraction. Timing only the instant of core contact is wrong and produces segments that are too short. If a segment is still under 3 seconds, widen it to these natural boundaries or merge it with adjacent motion on the same object. A video of 4 to 8 seconds usually yields exactly ONE segment; split it only when clearly different objects or goals appear. Exception: one continuous manipulation of the same object lasting longer than 10 seconds stays ONE segment — never split a continuous same-object action to satisfy the 10-second limit.
+
+Additional constraints:
+- Use non-overlapping segments.
+- Set segment times in seconds relative to the input video.
+- If the main action is identifiable but partially occluded, keep the segment and set `"is_good_quality": false`.
+- If no meaningful hand-object action exists, return an empty JSON array.
+
+## Language Instruction Levels
+For each segment:
+- **Level 1 (Verb + Object):** Core task. Max 5 words. Example: "Open the drawer."
+- **Level 2 (Gist):** Concise summary of the hand action. Max 15 words.
+- **Level 3 (Object-Centric):** Describe the manipulated object, relevant parts, state, and spatial features. Max 30 words.
+- **Level 4 (Hand-Centric):** Specify left/right hand roles, grasp style, contact points, and coordination. Max 50 words.
+
+## Strict Requirements
+- Start every instruction with an action verb. Do not use subjects such as "I," "the person," "the worker," or "the hand."
+- Use "the" for visible objects; avoid "a" or "an" in generated instructions.
+- Omit "then", "next", "afterwards", and similar transitional words.
+- **Level 1 must contain exactly ONE verb** — the most specific verb for what the segment accomplishes on its main object. The preparatory grasp and the final release are implied by that one verb. Write "Stir the bowl.", never "Grab the spoon and stir the bowl." and never "Stir and lift the bowl."
+- Use transport verbs ("Pick up," "Lift," "Place," "Put down," "Move," "Release") **only** when the segment's whole purpose is relocating the object. When a held object acts on a target, name **that** action. If the hands acquire a tool, use it on a target, and set it down within one segment, the Level 1 verb names the tool's action on the target: "Brush the cup.", never "Pick up the brush.", "Place the brush.", or "Move the brush."
+- Name the task goal when the motion, the held object, and the target imply it, even if the outcome is
+  partly off-screen or subtle: describe **what the held object is doing to the target**, not merely that
+  it is held or moved.
+- Do not invent brand names, materials, or objects that are not visible, and do not narrate intent that
+  has no visible physical support.
+
+## Quality Judgement
+Set `"is_good_quality": true` only if:
+1. The segment's main hand-object action is completed or reaches a clear stable outcome.
+2. The movement is steady enough to understand the action.
+3. The relevant hand-object contact and manipulated object are clearly visible.
+
+## Few-Shot Examples
+
+## Output Format
+Return a single JSON array. No markdown code fences. No extra text.
+
+[
+  {
+    "start": <float, seconds>,
+    "end": <float, seconds>,
+    "is_good_quality": <true/false>,
+    "language_instructions": {
+      "level1": "<verb and object>",
+      "level2": "<concise summary>",
+      "level3": "<object-focused description>",
+      "level4": "<hand/object interaction details>"
+    }
+  }
+]
+
+### Example A: Two Objects, Two Segments — Both Kept
+Video content: The first part shows the right hand opening a drawer. A later part shows both hands placing a folded towel into the opened drawer. Idle time between the actions is not included.
+
+Expected output style:
+[
+  {
+    "start": 0.8,
+    "end": 4.0,
+    "is_good_quality": true,
+    "language_instructions": {
+      "level1": "Open the drawer.",
+      "level2": "Pull the drawer open from the cabinet.",
+      "level3": "Open the front drawer by pulling the handle outward until the storage space is exposed.",
+      "level4": "Hook the right fingers around the drawer handle and pull straight outward while the left hand stays clear."
+    }
+  },
+  {
+    "start": 5.1,
+    "end": 8.6,
+    "is_good_quality": true,
+    "language_instructions": {
+      "level1": "Place the towel.",
+      "level2": "Place the folded towel inside the open drawer.",
+      "level3": "Lower the folded towel into the open drawer and align it flat against the drawer base.",
+      "level4": "Support the towel with both hands, guide it over the drawer opening, and release it once it lies flat."
+    }
+  }
+]
+
+Dropping either segment would be wrong: each object's manipulation must appear in exactly one segment.
+
+### Example B: Same Object Stays One Segment, One Verb
+Video content: The right hand picks up a cloth at 0.4s, wipes the tabletop, and puts the cloth back down at 4.1s.
+
+WRONG output (do not do this): three segments "Pick up the cloth." / "Wipe the tabletop." / "Put down the cloth.", or a Level 1 such as "Pick up the cloth and wipe the tabletop."
+
+Expected output style:
+[
+  {
+    "start": 0.4,
+    "end": 4.1,
+    "is_good_quality": true,
+    "language_instructions": {
+      "level1": "Wipe the tabletop.",
+      "level2": "Wipe the tabletop surface with the held cloth.",
+      "level3": "Clear the tabletop surface by dragging the cloth across it in overlapping passes.",
+      "level4": "Grip the cloth with the right hand, press it flat against the surface, sweep it back and forth, and set it down when the surface is clean."
+    }
+  }
+]
+
+### Example C: Long Continuous Same-Object Action Stays One Segment
+Video content: Both hands stir a pot of soup continuously from 1.0s to 15.5s.
+
+Expected output style: one segment from 1.0 to 15.5 with level1 "Stir the soup." — do NOT split a continuous same-object action to satisfy the 10-second limit.
+
+### Example D: Video Shorter Than 4 Seconds
+Video content: A 3.2-second video where the right hand brushes crumbs off a kettle.
+
+Expected output style: exactly one segment from 0.0 to 3.2 with level1 "Brush the kettle." — never more than one segment for a video under 4 seconds.
+
+### Example E: Valid but Low Quality Segment
+Video content: The hands pour liquid from a bottle into a cup, but the bottle opening is partially outside the frame near the end.
+
+Expected output style:
+[
+  {
+    "start": 0.6,
+    "end": 4.2,
+    "is_good_quality": false,
+    "language_instructions": {
+      "level1": "Pour the liquid.",
+      "level2": "Pour the liquid from the bottle into the cup.",
+      "level3": "Tilt the bottle above the cup while the bottle opening becomes partly cropped near the end.",
+      "level4": "Grip the bottle body with the right hand and steady the cup area with the left hand while the pouring contact is partly hidden."
+    }
+  }
+]
+
+### Example F: No Valid Segment
+Video content: The camera scans a tabletop and the hands never manipulate an object.
+
+Expected output style:
+[]

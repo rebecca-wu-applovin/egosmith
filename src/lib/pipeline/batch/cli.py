@@ -65,6 +65,21 @@ def add_any4d_runtime_args(
             default=True,
             help="Predict dense depth for all frames in the SLAM stage. Default: enabled.",
         )
+    parser.add_argument(
+        "--use_gt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load pre-staged ground-truth camera (SLAM npz) + hand poses (world_space_res) at the "
+             "slam/infiller stages instead of reconstructing, when present in the seq_folder; "
+             "detect_track/motion still run. Falls back to reconstruction if no GT is staged.",
+    )
+    parser.add_argument(
+        "--use_anycalib",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Estimate the camera focal with AnyCalib in detect_track (written to est_focal.txt) "
+             "instead of the W/2 default guess. Skipped if --img_focal or est_focal.txt is already set.",
+    )
     parser.add_argument("--any4d_repo_root", type=str, default=None, help="Optional Any4D repository root.")
     parser.add_argument("--any4d_checkpoint_path", type=str, default=None, help="Optional Any4D checkpoint path.")
     parser.add_argument("--any4d_resolution_set", type=int, default=None, help="Optional Any4D resolution set.")

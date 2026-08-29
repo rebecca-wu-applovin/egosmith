@@ -1,0 +1,45 @@
+# EgoVerse-Lightwheel variant of heuristic_clip_config.yaml. The Lightwheel rig is
+# a wide-FOV head-mounted stereo camera (1920x1456, equiDis62 fisheye; we consume the
+# vendor-undistorted pinhole stream, fx 786.73 @1920w). Two FOV-driven changes vs
+# production, measured on real pilot footage 2026-08-26 (episode 00167cb4):
+#   * decode 448x340 (matched 1.32 aspect) — the production 448x256 squash shrinks
+#     hand-box areas 1.33x (same failure mode as the egoexo4d square variant).
+#   * min_area_ratio 0.005 (from 0.02) — hands at this FOV occupy ~0.5-2% of frame;
+#     at production 0.02 Gate A passes 0/116 sampled frames despite YOLO hand conf
+#     0.6-0.8. At 0.005 + matched aspect: min_hands=2 passes 93/116.
+# Gates/thresholds otherwise IDENTICAL to production (min_hands=2 two-handed
+# manipulation semantics retained; Gate B/C untouched).
+paths:
+  model_path: ''
+runtime:
+  postfix_update_every: 10
+  gc_every: 32
+heuristic:
+  skip_frames: 15
+  decode_width: 448
+  decode_height: 340
+  fallback_full_video: false
+  output_size: null
+  gate_a:
+    roi:
+    - 0.075
+    - 0.075
+    - 0.925
+    - 1.0
+    min_area_ratio: 0.005
+    max_area_ratio: 0.5
+    conf_thresh: 0.3
+    box_conf_thresh: 0.3
+    min_hands: 2
+  gate_b:
+    flow_max_corners: 128
+    flow_quality_level: 0.01
+    flow_min_distance: 7
+    flow_block_size: 7
+    flow_min_tracked: 24
+    camera_motion_thresh: 0.2
+    ransac_reproj_thresh: 3.0
+    min_inlier_ratio: 0.3
+  gate_c:
+    min_keep_sec: 2.0
+    max_consecutive_invalid: 3

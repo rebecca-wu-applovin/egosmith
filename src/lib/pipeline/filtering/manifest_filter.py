@@ -45,6 +45,13 @@ def build_parser():
         help="Enable optional outlier checks; NaN/Inf and missing-language hard filters always stay enabled",
     )
     parser.add_argument("--min_presence_ratio", type=float, default=None, help="Optional minimum fraction of frames with presence > 0")
+    parser.add_argument(
+        "--min_presence_ratio_per_hand",
+        type=float,
+        default=None,
+        help="Optional minimum per-hand valid-pose frame ratio; drops clips where EITHER hand is "
+             "below (reason single_valid_hand). Use on datasets whose Stage-1 required 2 hands.",
+    )
     # Per-frame "abrupt jump" hard caps -- set above plausible human motion at ~30 fps
     # so they only catch reconstruction glitches (teleports / SLAM jumps), not real motion.
     parser.add_argument("--max_hand_translation_step", type=float, default=0.30, help="Max allowed per-frame wrist translation step in meters (~9 m/s glitch cap)")
@@ -64,6 +71,14 @@ def build_parser():
         type=float,
         default=0.2,
         help="Minimum ratio of visible-hand frames where wrist/fingertips have at least one projected point inside the image",
+    )
+    parser.add_argument(
+        "--min_hand_size_ratio",
+        type=float,
+        default=None,
+        help="Layer-A hand-size gate ported to Layer C: drop clips where even the closest visible "
+             "hand's projected-joint bbox never covers this fraction of the image (far/small interaction). "
+             "None = off.",
     )
     parser.add_argument(
         "--max_visible_hand_all_points_out_of_frame_streak",
@@ -306,6 +321,7 @@ def build_report(
         "min_instruction_num": criteria["min_instruction_num"],
         "outlier_checks": bool(criteria["outlier_checks"]),
         "min_presence_ratio": criteria["min_presence_ratio"],
+        "min_presence_ratio_per_hand": criteria["min_presence_ratio_per_hand"],
         "max_hand_translation_step": criteria["max_hand_translation_step"],
         "max_finger_translation_step": criteria["max_finger_translation_step"],
         "max_camera_translation_step": criteria["max_camera_translation_step"],
@@ -314,6 +330,7 @@ def build_report(
         "episode_camera_iqr_multiplier": criteria.get("episode_camera_iqr_multiplier"),
         "fatal_offscreen_scale": criteria["fatal_offscreen_scale"],
         "min_visible_hand_any_point_inframe_ratio": criteria["min_visible_hand_any_point_inframe_ratio"],
+        "min_hand_size_ratio": criteria.get("min_hand_size_ratio"),
         "max_visible_hand_all_points_out_of_frame_streak": criteria["max_visible_hand_all_points_out_of_frame_streak"],
         "camera_space_auto_method": criteria["camera_space_auto_method"],
         "camera_space_iqr_multiplier": criteria["camera_space_iqr_multiplier"],
@@ -388,6 +405,7 @@ def run_filter(args) -> dict:
         "min_instruction_num": args.min_instruction_num,
         "outlier_checks": bool(args.outlier_checks),
         "min_presence_ratio": args.min_presence_ratio,
+        "min_presence_ratio_per_hand": args.min_presence_ratio_per_hand,
         "max_hand_translation_step": args.max_hand_translation_step,
         "max_finger_translation_step": args.max_finger_translation_step,
         "max_camera_translation_step": args.max_camera_translation_step,
@@ -396,6 +414,7 @@ def run_filter(args) -> dict:
         "episode_camera_iqr_multiplier": args.episode_camera_iqr_multiplier,
         "fatal_offscreen_scale": float(args.fatal_offscreen_scale),
         "min_visible_hand_any_point_inframe_ratio": args.min_visible_hand_any_point_inframe_ratio,
+        "min_hand_size_ratio": args.min_hand_size_ratio,
         "max_visible_hand_all_points_out_of_frame_streak": args.max_visible_hand_all_points_out_of_frame_streak,
         "max_camera_space_wrist_abs": args.max_camera_space_wrist_abs,
         "max_camera_space_hand_abs": args.max_camera_space_hand_abs,
@@ -415,6 +434,7 @@ def run_filter(args) -> dict:
     if not config["outlier_checks"]:
         for key in (
             "min_presence_ratio",
+            "min_presence_ratio_per_hand",
             "max_hand_translation_step",
             "max_finger_translation_step",
             "max_camera_translation_step",

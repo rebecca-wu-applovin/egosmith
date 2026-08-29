@@ -1,0 +1,39 @@
+# DexWild robot spec -- LEAP Hand V2 (left + right), xArm-mounted, in-the-wild teleop.
+# DoF VERIFICATION: left/right_leapv2 HDF5 datasets are (T,18) = 1 ns-timestamp column
+#   + 17 joint values -> LEAP V2 hand = 17 DoF per hand (not 16: V2 adds palm articulation).
+# Data lives as a SINGLE ~94 GiB HDF5 inside a split tar (robot_clothes_data.part_00..04);
+# the adapter reads it in place over GCS ranged reads (tar header = 512 B offset).
+# ~30 Hz effective (mean dt 33.4 ms from the per-sample ns timestamps; dt ALWAYS taken
+# from those timestamps, never an assumed rate).
+# arm_eef / intergripper streams are Cartesian poses -> kind aux (no joint-limit gates);
+# no commanded-joint stream exists in the robot HDF5 -> tracking gate disabled.
+#
+# Limit derivation: pos = [p0.1-0.15, p99.9+0.15]; vel/acc = p99.9 x 1.5 capped at
+# 12 rad/s / 500 rad/s^2 (a few joints' suggestions were glitch-polluted, e.g. 22.8 rad/s).
+# CALIBRATION SAMPLE: 12 episodes of clothes_data/robot (remote reads are ~13 s/episode);
+# refresh with a larger sample before a full-dataset run.
+robot: leapv2_bimanual_xarm
+dataset: dexwild
+streams:
+  left_leapv2:
+    kind: measured
+    dof: 17
+    pos_min: [-0.953, -0.094, 0.005, -0.816, -0.034, 0.025, -0.755, 0.15, 0.002, -1.02, -0.026, -0.033, 0.616, -0.214, 0.048, -0.192, -0.427]
+    pos_max: [0.463, 1.3, 1.78, 0.734, 1.33, 1.42, 0.944, 1.58, 0.788, 0.77, 1.47, 1.11, 1.58, 0.282, 1.23, 1.08, 1.47]
+    max_vel: [3.34, 5.27, 2.97, 4.78, 5.89, 2.58, 6.04, 4.8, 1.96, 6.97, 4.17, 1.79, 2.31, 1.4, 1.46, 3.64, 9.24]
+    max_acc: [73, 159, 84.8, 254.1, 201.5, 101.2, 176.8, 241.3, 95.1, 181.8, 126.3, 54.5, 213.2, 113, 38.2, 88.6, 289.6]
+  right_leapv2:
+    kind: measured
+    dof: 17
+    pos_min: [-0.701, -0.041, 0.009, -0.53, -0.04, 0.099, -0.602, 0.012, 0.016, -0.883, -0.003, -0.015, -0.288, -0.237, 0.026, -0.174, -0.323]
+    pos_max: [0.115, 1.32, 1.34, 0.473, 1.54, 1.19, 0.429, 1.58, 0.99, 0.643, 1.55, 1.33, 1.73, 1.31, 2.09, 1.41, 1.65]
+    max_vel: [1.85, 7.22, 2.82, 2.35, 12, 6.11, 3.49, 6.38, 2.31, 6.11, 6.66, 2.23, 4.38, 2.91, 4.23, 4.71, 12]
+    max_acc: [95, 408.3, 149, 85.9, 500, 309.4, 379, 281.6, 84.6, 401.3, 500, 217.7, 195.8, 118.8, 111.2, 174.6, 500]
+gates:
+  pos_limit: {max_violation_frac: 0.005}  # small calibration sample -> looser than 0.002
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 5}
+  health: {min_len_s: 2.0, max_stall_s: 10.0, stall_eps_rad_s: 0.005, max_nan_frac: 0.0, max_const_channel_frac: 0.6}
+  dedup: {downsample_hz: 5, quant: 0.01}

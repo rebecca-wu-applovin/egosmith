@@ -1,0 +1,70 @@
+# Cat-1 Phase B convert — HUB (Kueue MultiKueue) variant of job_cat1_convert.template.yaml
+# for the g2-standard-8 / 1xL4 pools. All hub lessons preserved:
+#   * ns robot, SA robot, queue-name label, spec.suspend=true
+#   * NO ephemeral-storage in resources (uncovered by every ClusterQueue -> inadmissible)
+#   * nodeSelector pins instance-type + nvidia-l4 (b40 flavor otherwise merges in)
+#   * region affinity us-central1/us-east1 only (never let FIFO overflow to tpe/ehd)
+#   * jobs carry the model-serve toleration themselves (flavors only inject nvidia.com/gpu)
+# NPROC=2 + REMUX_MAX_GB=8 bound concurrent source bytes on the small nodes
+# (scratch sizeLimit is the only disk guard — no ephemeral requests allowed).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cat1-convert-${JOB_SUFFIX}
+  namespace: robot
+  labels:
+    kueue.x-k8s.io/queue-name: robot
+spec:
+  suspend: true
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: ${BACKOFF_LIMIT}
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: robot
+      nodeSelector:
+        node.kubernetes.io/instance-type: g2-standard-8
+        cloud.google.com/gke-accelerator: nvidia-l4
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/region
+                operator: In
+                values: ["us-central1", "us-east1"]
+      tolerations:
+      - {key: "applvn.dev/workload", operator: "Equal", value: "model-serve", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule"}
+      containers:
+      - name: cat1-convert
+        image: ${IMAGE}
+        command: ["bash","-lc","set -x; gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_cat1_convert.sh /tmp/pe.sh || exit 1; LOG=gs://foundational-research/hoi-dataset/egosmith_filtered/${DS}/phaseB/_livelogs/live_shard$(printf %05d ${SHARD})_$(date +%s).log; (while true; do sleep 30; gcloud storage cp /tmp/pe.log $LOG >/dev/null 2>&1; done) & SHIP=$!; bash /tmp/pe.sh > /tmp/pe.log 2>&1; EC=$?; kill $SHIP; gcloud storage cp /tmp/pe.log $LOG; exit $EC"]
+        workingDir: /repo
+        env:
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: DS,          value: "${DS}"}
+        - {name: NSHARDS,     value: "${COMPLETIONS}"}
+        - {name: NPROC,       value: "2"}
+        - {name: MAX_CLIPS,   value: "${MAX_CLIPS}"}
+        - {name: TARGET_FPS,  value: "15"}
+        - {name: OUT_WIDTH,   value: "456"}
+        - {name: ID_MODE,     value: "${ID_MODE}"}
+        - {name: REMUX_MAX_GB, value: "8"}
+        - {name: LOCAL_ROOT,  value: "/scratch/cat1_convert"}
+        resources:
+          requests: {nvidia.com/gpu: "1", cpu: "6", memory: "20Gi"}
+          limits:   {nvidia.com/gpu: "1", cpu: "7", memory: "28Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 40Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 6Gi}

@@ -49,6 +49,8 @@ def _build_runtime(config: BatchRunConfig, gpu: int) -> WorkerRuntime:
         infiller_window_batch_size=config.infiller_window_batch_size,
         rebuild_cam_space_cache=config.rebuild_cam_space_cache,
         depth_predict_all_frames=config.depth_predict_all_frames,
+        use_gt=config.use_gt,
+        use_anycalib=config.use_anycalib,
         any4d_repo_root=config.any4d_repo_root,
         any4d_checkpoint_path=config.any4d_checkpoint_path,
         any4d_resolution_set=config.any4d_resolution_set,

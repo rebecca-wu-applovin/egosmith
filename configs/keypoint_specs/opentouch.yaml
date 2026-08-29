@@ -1,0 +1,22 @@
+# OpenTouch (MIT, arXiv:2512.16842) — in-the-wild egocentric RGB + full-hand tactile +
+# right-hand 21-keypoint pose, 26 session .hdf5 files (one clip per demo_NNN),
+# gs://foundational-research/hoi-dataset/OpenTouch/data/ (mirror verified 27/27, 19.65 GiB).
+# Cat-2.5 audit verdict (2026-08-20): pose TRUSTWORTHY-conditional — projection chain
+# p_cam = T_device_camera @ inv(camera_pose_t) @ p_world (inframe 1.00 on probe clips);
+# landmarks HELD-STALE on tracking loss -> per-frame validity derived in the extractor
+# (frame invalid when landmarks are bit-identical to the previous frame). Right hand only
+# (hand_mode=right in every session); left hand is never valid -> parked per the
+# missing-hand convention. Wrist rotation derived from keypoints (wrist/9/5).
+# fps measured from timestamps: exact 30.0. Filter: --stages native_features
+# --source_fps 30 --target_fps 30 --min_presence_ratio 0.5.
+dataset: opentouch
+source_id: opentouch
+split: train
+fps: 30            # measured: median dt 33.31 ms across sessions
+lowdim_schema: opentouch_keypoints_world_v1
+extractor: opentouch_hdf5
+presence_requires_projection: true  # presence bit = tracked AND projects into camera (1.3x margin)
+extractor_args:
+  local_dir: /root/w9/opentouch   # gsutil -m cp gs://.../OpenTouch/data/*.hdf5 here first
+  stale_eps: 1.0e-12
+  min_frames: 3

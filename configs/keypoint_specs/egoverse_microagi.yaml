@@ -1,0 +1,28 @@
+# EgoVerse microagi — 355,926 zarr-v3 episodes (avg ~8.5s @29fps) + sibling mp4
+# (640x360, matches in-zarr images + intrinsics -> mp4 decode, cheaper than zarr chunks).
+# Kpt audit PASS 50/50 conv-A, inb p10 1.0, 5/5 overlays lock
+# (_audits/egoverse_microagi_kpt_audit_2026-08-27/). In-zarr annotations
+# ({text,start_idx,end_idx}) read into extra.annotations as the labeling seed.
+dataset: egoverse_microagi
+source_id: egoverse_microagi
+split: train
+fps: 29            # per-episode attrs.fps overrides at load time
+lowdim_schema: egoverse_keypoints_world_v1
+extractor: egoverse_zarr3
+presence_requires_projection: true
+glitch_jump_thresh_m: 0.05
+glitch_rot_spike_frob: 0.99
+extractor_args:
+  gcs_prefix: gs://foundational-research/hoi-dataset/EgoVerse/processed_v3
+  sources: [microagi]
+  quat_order: wxyz
+  camera: front_1
+  keypoint_tip_indices: [4, 8, 12, 16, 20]
+  pose_frame: world
+  frames_source: mp4
+  min_kpt_coverage: 0.5
+  read_annotations: true
+
+# Re-gauge world to first-frame camera centre (w2c-translation step artifact fix;
+# measured: scale world origin ~43 m from camera -> 22 cm/frame fake cam steps)
+recenter_world: true

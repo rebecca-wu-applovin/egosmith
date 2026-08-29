@@ -1,0 +1,53 @@
+# RealDex spec -- Shadow Dexterous Hand (rh_*) on a UR arm (ra_*), rosbag-extracted.
+# The GCS mirror is PARTIAL: 3 object zips (air_duster, bathroom_cleaner, beer) = 5
+# sequences total, out of the full RealDex release. QC covers what is mirrored.
+# Joint streams are reconstructed from TF revolute-pair time series
+# (TF/<parent>-<child>.txt lines: t_ns tx ty tz qx qy qz qw); the per-pair rotation
+# magnitude equals the joint angle UP TO SIGN, so pos limits below are on |angle|.
+# hand_angles: 24 TF pairs (4x4 fingers incl. little-finger metacarpal + 5 thumb + 2 wrist)
+#   -> Shadow Hand 24-DoF kinematic tree confirmed in the TF graph.
+# arm_angles: 6 UR revolute pairs. All dt from per-message ns timestamps in the TF files.
+# Limit derivation method (no manufacturer spec sheet available for this exact stack):
+#   - pos_min/pos_max = [p0.1 - 0.15 rad, p99.9 + 0.15 rad] of the sampled measured-joint
+#     distribution (sample sizes listed below). Positions outside this envelope indicate
+#     encoder glitches / retarget blowups rather than legitimate motion.
+#   - max_vel = per-joint p99.9(|dq/dt|) x 1.5, dt taken from the DATA (per-frame timestamps
+#     when present, else metadata fps). NEVER an assumed frame rate -- limits are
+#     velocity x frame-interval and a wrong fps silently rescales every limit.
+#   - max_acc = per-joint p99.9(|d2q/dt2|) x 1.5, same dt sourcing.
+#   - caps: where the p99.9x1.5 suggestion itself is polluted by glitches (>0.1% of frames
+#     jumping), a physical cap is applied instead and noted inline.
+# Calibration sample: 5 sequences (all currently mirrored) -- SMALL SAMPLE;
+# refresh limits when more objects land. floors applied so tiny-sample p99.9 doesn't
+# produce degenerate limits.
+robot: shadow_hand_ur_arm
+dataset: realdex
+license_note: >-
+  LICENSE CONCERN: RealDex ships under academic/research-only terms (per the RealDex
+  release; no LICENSE file is present in the GCS mirror to confirm redistribution
+  rights). Episodes are processed anyway per instruction -- downstream use must
+  re-review before any commercial training.
+streams:
+  hand_angles:
+    kind: measured
+    dof: 24
+    pos_min: [0, 0, 0, 0, 0, 0, 0.186, 0, 0, 0, 0.227, 0, 0, 0, 0, 0.136, 0, 0.685, 0.457, 0, 0, 1.47, 0, 0]
+    pos_max: [0.433, 0.872, 1.57, 1.52, 0.44, 1.46, 1.66, 1.1, 0.458, 1.31, 1.65, 1.12, 0.816, 0.504, 1.17, 1.62, 0.928, 1.24, 1.4, 0.347, 0.404, 1.69, 0.617, 0.786]
+    max_vel: [2.04, 4.81, 8.54, 11.8, 1.87, 4.71, 8.9, 11.9, 1.93, 4.33, 8.38, 10.3, 2.32, 1.89, 2.79, 8.07, 9.83, 1.57, 1.47, 1.64, 3.04, 1, 1.31, 1.46]
+    max_acc: [60.5, 249.1, 321.6, 428.1, 69.4, 235.7, 330.6, 399, 80.1, 208.8, 295.8, 324.7, 35.7, 42.3, 52.2, 272.5, 303.2, 30, 30, 58.3, 125.3, 30, 48.6, 57.7]
+  arm_angles:
+    kind: measured
+    dof: 6
+    pos_min: [0, 1.48, 0.796, 0, 1.41, 1.71]
+    pos_max: [0.891, 2.21, 2.2, 1.29, 2.5, 3.31]
+    max_vel: [1, 1, 1, 1.16, 1, 2.04]
+    max_acc: [15, 15, 15, 15, 15, 15]
+gates:
+  pos_limit: {max_violation_frac: 0.005}  # 5-sequence calibration sample -> looser than default 0.002
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  # no commanded-joint stream in the TF dump -> tracking gate disabled
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 10}
+  health: {min_len_s: 2.0, max_stall_s: 15.0, stall_eps_rad_s: 0.003, max_nan_frac: 0.0, max_const_channel_frac: 0.7}
+  dedup: {downsample_hz: 5, quant: 0.01}

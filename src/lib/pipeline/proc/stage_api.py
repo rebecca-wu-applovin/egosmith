@@ -43,6 +43,8 @@ class StageExecutionConfig:
     detect_device: str = "cuda:0"
     detect_half_precision: bool = True
     depth_predict_all_frames: Optional[bool] = None
+    use_gt: bool = False
+    use_anycalib: bool = False
     any4d_repo_root: Optional[str] = None
     any4d_checkpoint_path: Optional[str] = None
     any4d_resolution_set: Optional[int] = None
@@ -72,6 +74,8 @@ class StageExecutionConfig:
             detect_device=getattr(ns, "detect_device", "cuda:0"),
             detect_half_precision=bool(getattr(ns, "detect_half_precision", True)),
             depth_predict_all_frames=getattr(ns, "depth_predict_all_frames", None),
+            use_gt=bool(getattr(ns, "use_gt", False)),
+            use_anycalib=bool(getattr(ns, "use_anycalib", False)),
             any4d_repo_root=getattr(ns, "any4d_repo_root", None),
             any4d_checkpoint_path=getattr(ns, "any4d_checkpoint_path", None),
             any4d_resolution_set=getattr(ns, "any4d_resolution_set", None),
@@ -97,6 +101,8 @@ class StageExecutionConfig:
             detect_device=self.detect_device,
             detect_half_precision=self.detect_half_precision,
             depth_predict_all_frames=self.depth_predict_all_frames,
+            use_gt=self.use_gt,
+            use_anycalib=self.use_anycalib,
             any4d_repo_root=self.any4d_repo_root,
             any4d_checkpoint_path=self.any4d_checkpoint_path,
             any4d_resolution_set=self.any4d_resolution_set,

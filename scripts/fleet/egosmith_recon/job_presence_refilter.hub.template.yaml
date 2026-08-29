@@ -1,0 +1,54 @@
+# Presence re-filter fleet — HUB (Kueue MultiKueue) CPU-ONLY job. Adapted from
+# job_egocentric_stage1.hub.template.yaml with the hub lessons preserved:
+#   * ns robot, SA robot, kueue queue-name label, spec.suspend=true
+#   * NO ephemeral-storage in resources (uncovered resource -> Workload inadmissible)
+#   * region affinity us-central1/us-east1 only (bucket is US-CENTRAL1)
+#   * tolerations kept so pods may land on the tainted GPU pools if that is where
+#     the cohort quota lives — but NO gpu request and NO accelerator nodeSelector.
+# The work is pure GCS ranged reads + small rewrites: cpu 2 / 4Gi is plenty.
+# Render vars: JOB_SUFFIX IMAGE COMPLETIONS PARALLELISM DS SHARDS_PER_POD
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: presence-refilter-${JOB_SUFFIX}
+  namespace: robot
+  labels:
+    kueue.x-k8s.io/queue-name: robot
+spec:
+  suspend: true
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 400
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: robot
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/region
+                operator: In
+                values: ["us-central1", "us-east1"]
+      tolerations:
+      - {key: "applvn.dev/workload", operator: "Equal", value: "model-serve", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule"}
+      containers:
+      - name: presence-refilter
+        image: ${IMAGE}
+        command: ["bash","-lc","set -x; gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_presence_refilter.sh /tmp/pe.sh || exit 1; LOG=gs://foundational-research/hoi-dataset/egosmith_filtered/${DS}/filter_run/_presence2_livelogs/live_shard$(printf %05d ${SHARD})_$(date +%s).log; (while true; do sleep 30; gcloud storage cp /tmp/pe.log $LOG >/dev/null 2>&1; done) & SHIP=$!; bash /tmp/pe.sh > /tmp/pe.log 2>&1; EC=$?; kill $SHIP; gcloud storage cp /tmp/pe.log $LOG; exit $EC"]
+        env:
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: DS,             value: "${DS}"}
+        - {name: SHARDS_PER_POD, value: "${SHARDS_PER_POD}"}
+        - {name: WORKERS,        value: "64"}
+        - {name: SHARD_PARALLEL, value: "1"}
+        resources:
+          # cpu/memory ONLY — see header. IO-bound threaded GCS reads.
+          requests: {cpu: "2", memory: "4Gi"}
+          limits:   {cpu: "4", memory: "8Gi"}

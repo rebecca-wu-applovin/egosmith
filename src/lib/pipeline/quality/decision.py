@@ -65,6 +65,18 @@ def decide_clip_quality(
         and metrics["visible_right_any_point_inframe_ratio"] < criteria["min_visible_hand_any_point_inframe_ratio"]
     ):
         reasons.append("visible_right_inframe_ratio_below_min")
+    # Layer-A hand-size gate (ported into Layer C): drop when even the CLOSEST visible hand
+    # never reaches min_hand_size_ratio — i.e. the interaction is far/small throughout, so the
+    # pose is unreliable. Gating on the max across visible hands avoids dropping a clip merely
+    # because one resting hand is far.
+    if criteria.get("min_hand_size_ratio") is not None:
+        _sizes = []
+        if metrics.get("visible_left_frames", 0) > 0:
+            _sizes.append(metrics.get("max_visible_left_hand_size_ratio", 0.0))
+        if metrics.get("visible_right_frames", 0) > 0:
+            _sizes.append(metrics.get("max_visible_right_hand_size_ratio", 0.0))
+        if _sizes and max(_sizes) < criteria["min_hand_size_ratio"]:
+            reasons.append("hand_too_small")
     if (
         criteria.get("max_visible_hand_all_points_out_of_frame_streak") is not None
         and metrics.get("max_visible_left_out_of_frame_streak", 0) > criteria["max_visible_hand_all_points_out_of_frame_streak"]
@@ -79,6 +91,13 @@ def decide_clip_quality(
         reasons.append("instruction_num_below_min")
     if criteria.get("min_presence_ratio") is not None and metrics["presence_ratio"] < criteria["min_presence_ratio"]:
         reasons.append("presence_ratio_below_min")
+    # Per-hand presence gate: Stage-1 certified two visible hands for these datasets
+    # (min_hands=2), so reconstruction must deliver valid poses for BOTH hands.
+    if criteria.get("min_presence_ratio_per_hand") is not None and (
+        min(metrics["presence_left_ratio"], metrics["presence_right_ratio"])
+        < criteria["min_presence_ratio_per_hand"]
+    ):
+        reasons.append("single_valid_hand")
     if (
         criteria.get("max_hand_translation_step") is not None
         and metrics["max_hand_translation_step"] > criteria["max_hand_translation_step"]

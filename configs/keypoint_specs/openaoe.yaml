@@ -1,0 +1,23 @@
+# OpenAoE-2000h — HaWoR MANO pseudo-labels over undistorted smartphone ego video.
+# Layout: gs://.../OpenAoE-2000h/aoe_<stamp>_pNNN/ (19,298 session dirs), each with
+#   ego_process/ego_hands_reconstruction/hands.npz   pred_{trans,rot,hand_pose,betas,valid}
+#                                                    (2=L/R, T, ...) world frame + R_w2c/t_w2c
+#   ego_process/ego_undistorted_video/raw_video_undistorted.mp4 + undistorted_video_info.json
+#   ego_annotation/ego_action_annotation.json        (language; not consumed here)
+# Wrist translation = MANO joint-0 world (run_mano_twohands forward); wrist rotation from
+# pred_rot (axis-angle); fingertips = MANO joints [4,8,12,16,20]. Extrinsic w2c from hands.npz;
+# intrinsics fx,fy,cx,cy from undistorted_video_info.json (pinhole after undistortion).
+# Presence from pred_valid > 0.5. Tier: pseudo-label (Cat-2 audit required before scale-out).
+dataset: openaoe
+source_id: openaoe
+split: train
+fps: 30            # undistorted_video_info.json["fps"]; pass to filter as --source_fps 30
+lowdim_schema: openaoe_hawor_world_v1
+extractor: hawor_npz
+extractor_args:
+  gcs_prefix: gs://foundational-research/hoi-dataset/OpenAoE-2000h
+  hands_rel: ego_process/ego_hands_reconstruction/hands.npz
+  video_rel: ego_process/ego_undistorted_video/raw_video_undistorted.mp4
+  video_info_rel: ego_process/ego_undistorted_video/undistorted_video_info.json
+  valid_thresh: 0.5
+  use_cuda: true   # MANO forward; set false on CPU-only boxes

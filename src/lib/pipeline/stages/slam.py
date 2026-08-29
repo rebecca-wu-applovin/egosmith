@@ -797,6 +797,29 @@ def hawor_slam(
 
     seq_folder = _resolve_seq_folder(args.video_path, seq_folder)
     os.makedirs(seq_folder, exist_ok=True)
+
+    # --- GT branch: load a pre-provided ground-truth camera instead of reconstructing (DPVO + Any4D).
+    # Runs the whole pipeline (detect_track/motion still execute), but when --use_gt is set and a GT
+    # SLAM npz is already staged in the seq_folder, we adopt it (normalizing the filename the loaders
+    # expect) and skip the heavy monocular SLAM. Falls back to reconstruction if no GT is present.
+    if getattr(args, "use_gt", False):
+        slam_dir = Path(seq_folder) / "SLAM"
+        expected = slam_dir / f"hawor_slam_w_scale_{start_idx}_{end_idx}.npz"
+        gt_npz = expected if expected.is_file() else None
+        if gt_npz is None and slam_dir.is_dir():
+            cands = sorted(slam_dir.glob("hawor_slam_w_scale_*.npz"))
+            gt_npz = cands[0] if cands else None
+        if gt_npz is not None:
+            if gt_npz.resolve() != expected.resolve():
+                expected.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(gt_npz, expected)
+            vprint(f"slam: use_gt -> using GT camera {gt_npz.name} (skipped DPVO+Any4D+scale)")
+            if return_timing:
+                return {"timing": {"total": time.time() - start_time, "gt_loaded": True},
+                        "stats": {"gt_loaded": 1}}
+            return
+        vprint("slam: use_gt set but no GT SLAM npz found in seq_folder -> reconstructing")
+
     frame_source = _resolve_frame_source(args.video_path, frame_source)
     segment_frame_ids = _segment_frame_ids(start_idx, end_idx, len(frame_source))
     if segment_frame_ids.size == 0:

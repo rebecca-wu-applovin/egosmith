@@ -405,6 +405,44 @@ def analyze_video_intervals(video_path: str | Path, cfg: dict, *, model=None) ->
     }
 
 
+def analyze_frame_source_intervals(frame_source, cfg: dict, *, model=None, fps: float = 30.0) -> tuple[list[ClipInterval], dict]:
+    """Same Stage-1 gates as analyze_video_intervals, but over a frame source (tar) instead
+    of a decoded video file — so the pre-filter runs on already-extracted frame tars."""
+    import cv2
+
+    heuristic = _heuristic_section(cfg)
+    gate_a = heuristic.get("gate_a") or {}
+    gate_b = heuristic.get("gate_b") or {}
+    gate_c = heuristic.get("gate_c") or {}
+    skip_frames = max(1, int(heuristic.get("skip_frames", 15)))
+    decode_size = (int(heuristic.get("decode_width", 448)), int(heuristic.get("decode_height", 256)))
+    roi_px = _roi_bounds(decode_size[0], decode_size[1], gate_a.get("roi", [0.0, 0.0, 1.0, 1.0]))
+
+    n = len(frame_source)
+    samples = []
+    prev_gray = None
+    for frame_idx in range(n):
+        if frame_idx % skip_frames != 0:
+            continue
+        frame = frame_source.get_frame(frame_idx, rgb=False)  # HWC BGR uint8
+        frame_small = cv2.resize(frame, decode_size)
+        gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+        detect_ok = _detect_gate(model, frame_small, gate_a=gate_a)
+        motion_ok, score = _motion_gate(prev_gray, gray, gate_b=gate_b, gate_c=gate_c, roi_px=roi_px)
+        samples.append((frame_idx, bool(detect_ok and motion_ok), score))
+        prev_gray = gray
+
+    intervals = _merge_valid_samples(
+        samples, fps=fps, skip_frames=skip_frames,
+        min_keep_sec=float(gate_c.get("min_keep_sec", 2.0)),
+        max_consecutive_invalid=int(gate_c.get("max_consecutive_invalid", 3)),
+    )
+    return intervals, {
+        "fps": fps, "total_frames": n, "sample_count": len(samples),
+        "valid_sample_count": sum(1 for _idx, valid, _score in samples if valid),
+    }
+
+
 def _safe_stem(path: Path) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in path.stem).strip("._") or "clip"
 

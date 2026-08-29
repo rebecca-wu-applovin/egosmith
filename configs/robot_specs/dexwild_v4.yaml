@@ -1,0 +1,46 @@
+# DexWild robot spec v4 -- LEAP Hand V2, xArm-mounted, in-the-wild teleop.
+# NEW FILE (v1-v3 left untouched; new-files-only rule).
+#
+# WHY v4: three NEW robot splits landed 2026-08-24 (pour_data 111 eps, spray_data 388,
+# toy_data 546) and they are RIGHT-HAND-ONLY rigs (streams: right_arm_eef, right_leapv1
+# [aux, 16-DoF V1], right_leapv2, right_manus, 2 cams, timesteps -- NO left_* streams).
+# Two v3 incompatibilities:
+#   1. dof_spec treats every spec stream as required by default -> left_leapv2 missing
+#      would drop 100% of the new splits. v4 marks left_leapv2 `required: false`
+#      (still fully gated whenever present, i.e. on clothes/florist).
+#   2. v3's right-hand envelope was calibrated on clothes+florist only; new-split smoke
+#      calibration shows legitimate right-hand motion up to 0.65 rad outside it.
+# Limit derivation (2026-08-24): stratified every-8th-episode calibration over ALL FIVE
+# robot splits (37 clothes + 31 florist + 14 pour + 49 spray + 69 toy = 200 episodes;
+# /root/cat4_qc/dexwild/new_splits/strat_calib_all5.json), same formula as v3
+# (pos [p0.1-0.15, p99.9+0.15] rad; vel/acc p99.9 x 1.5 capped at 12 rad/s / 500 rad/s^2),
+# then UNION with the v3 envelope so no previously-kept clothes/florist episode can be
+# re-dropped by pooled percentiles shifting (left stream comes out byte-identical to v3).
+# Gate thresholds unchanged from v1-v3. Harness gate logic unmodified.
+robot: leapv2_bimanual_xarm
+dataset: dexwild
+spec_version: 4
+streams:
+  left_leapv2:
+    kind: measured
+    required: false   # right-only rigs (pour/spray/toy) have no left hand
+    dof: 17
+    pos_min: [-0.946, -0.154, -0.004, -0.857, -0.025, -0.041, -0.78, 0.152, -0.083, -0.966, -0.034, -0.157, -0.074, -0.276, 0.061, -0.192, -0.61]
+    pos_max: [0.537, 1.404, 1.822, 0.779, 1.489, 1.506, 0.899, 1.869, 0.824, 0.974, 1.692, 1.511, 1.602, 0.366, 1.129, 1.34, 1.465]
+    max_vel: [6.76, 7.28, 5.44, 9.68, 9.51, 5.22, 9.24, 9.5, 4.36, 11.58, 12, 3.81, 6.74, 2.58, 4.38, 7.21, 12]
+    max_acc: [356.3, 500, 499.5, 500, 489.7, 438.8, 434.2, 500, 298.4, 406.9, 500, 324.7, 414.5, 160.5, 306, 309.2, 500]
+  right_leapv2:
+    kind: measured
+    dof: 17
+    pos_min: [-1.338, -0.077, -0.172, -0.649, -0.031, 0.046, -0.658, -0.004, -0.073, -0.827, 0.002, -0.17, -0.285, -0.247, 0.019, -0.194, -0.418]
+    pos_max: [0.222, 1.517, 1.509, 0.451, 1.581, 1.502, 0.541, 1.805, 1.152, 0.826, 1.92, 1.833, 1.715, 1.157, 2.023, 1.394, 1.643]
+    max_vel: [8.88, 12, 9.27, 5.09, 12, 6.75, 5.78, 12, 6.96, 10.38, 12, 7.93, 5.77, 3.24, 4.65, 8.11, 12]
+    max_acc: [500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500]
+gates:
+  pos_limit: {max_violation_frac: 0.005}
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 5}
+  health: {min_len_s: 2.0, max_stall_s: 10.0, stall_eps_rad_s: 0.005, max_nan_frac: 0.0, max_const_channel_frac: 0.6}
+  dedup: {downsample_hz: 5, quant: 0.01}

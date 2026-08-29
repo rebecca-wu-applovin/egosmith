@@ -1,0 +1,55 @@
+# g2-standard-8 (1x L4 / 8 vCPU / ~32Gi) VARIANT of job_egodex_filter.template.yaml.
+# Targets the new MKS single-GPU L4 nodes (one pod per node). Originals untouched.
+# Changes vs original: nodeSelector by instance-type (no node_pool: l4, no zone pin),
+# model-serve + gpu-Exists tolerations, resources trimmed to 1x L4 / <=7 vCPU / <=28Gi.
+# NOTE: the original packed a FULL part shard (~90-100GB peak scratch) per pod on
+# whole 96-vCPU nodes. g2-standard-8 boot disks cannot host that: raise NSHARDS
+# (>= 3x the original 90) so per-shard extract+tar footprint stays under the ~50Gi
+# scratch budget below.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: egodex-filter-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 360
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node.kubernetes.io/instance-type: g2-standard-8
+      tolerations:
+      - {key: "applvn.dev/workload", operator: "Equal", value: "model-serve", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule"}
+      containers:
+      - name: egodex-filter
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_egodex_filter.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        workingDir: /repo
+        env:
+        - {name: NSHARDS,     value: "${NSHARDS}"}
+        # SHARD from the Indexed-Job completion-index annotation (NOT $(JOB_COMPLETION_INDEX),
+        # which k8s leaves as a literal string — pods would no-op).
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: SMOKE_LIMIT, value: "${SMOKE_LIMIT}"}
+        - {name: LOCAL_ROOT,  value: "/scratch/egodex_filter"}
+        resources:
+          # One pod per g2-standard-8 node: 1x L4, <=7 vCPU, mem limit <=28Gi.
+          # Shared with model-serve — conservative requests, preemption-tolerant.
+          requests: {nvidia.com/gpu: "1", cpu: "6", memory: "20Gi", ephemeral-storage: "40Gi"}
+          limits:   {nvidia.com/gpu: "1", cpu: "7", memory: "28Gi", ephemeral-storage: "50Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 48Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 6Gi}

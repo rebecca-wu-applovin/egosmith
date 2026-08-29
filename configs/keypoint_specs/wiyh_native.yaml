@@ -1,0 +1,21 @@
+# WIYH locked-tier native ingestion (W7 reopen): 25-joint glove skeleton -> world
+# (= chest frame; no odometry) via per-frame wrist SE3 + per-device-day anchor extrinsic.
+# Sessions gated by the wrist-lock census (scripts/build/wiyh_gate_census.py); finger
+# accuracy is anchor-limited (~35-65 px) -> tier ships TAGGED (finger_quality metadata).
+dataset: wiyh_native
+source_id: wiyh_native
+split: train
+fps: 10.0
+lowdim_schema: wiyh_native_25joint_world_v1
+extractor: wiyh_native
+# presence bit = census wrist gate (conf==1, |dt|<=25ms, eef<30px to hand mask)
+# AND projection into the rectified pinhole view:
+presence_requires_projection: true
+extractor_args:
+  index_dir: /root/w7_full/wiyh/index
+  census_path: /root/w7_native/census/census.jsonl
+  extrinsics_path: /root/w7_native/anchors/accepted_extrinsics.json
+  out_width: 456
+  out_height: 256
+  pinhole_focal: 120.0
+  jpeg_quality: 88

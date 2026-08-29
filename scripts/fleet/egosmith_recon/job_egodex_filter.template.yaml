@@ -1,0 +1,64 @@
+# EgoDex Layer-1 + Layer-4 (native/use_gt) filtering — K8s Indexed Job (rendered by expandvars).
+# One pod per episode-stride-shard of a raw zip part: pull part zip -> zipfile-extract shard ->
+# convert to frame tars -> upload tars -> Stage-1 -> Stage-4 native -> upload per-shard manifests.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: egodex-filter-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 360   # 90 shards; tolerate transient evictions/retries without nuking the whole job
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node_pool: l4
+      affinity:
+        nodeAffinity:
+          # us-central1-a L4 capacity is exhausted; force scale-up of the b/c
+          # instance groups of the multi-zone l4-5317 pool.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: ["us-central1-b", "us-central1-c"]
+      tolerations:
+      - {key: "l4-pool", operator: "Equal", value: "true", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Equal", value: "present", effect: "NoSchedule"}
+      containers:
+      - name: egodex-filter
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_egodex_filter.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        workingDir: /repo
+        env:
+        - {name: NSHARDS,     value: "${NSHARDS}"}
+        # SHARD = the Indexed-Job completion index, read from the annotation the controller
+        # sets per pod. Do NOT use value: "$(JOB_COMPLETION_INDEX)" — k8s leaves that literal
+        # (JOB_COMPLETION_INDEX isn't a declared env var), which made every pod no-op.
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: SMOKE_LIMIT, value: "${SMOKE_LIMIT}"}
+        - {name: LOCAL_ROOT,  value: "/scratch/egodex_filter"}
+        resources:
+          # Packed ~3 pods/8-GPU node (node = 96 vCPU, 384Gi RAM, 300GB pd-ssd, 8 L4).
+          # A full part shard extracts ~3082 episodes (~66GB raw) + frame tars (~25GB) =
+          # ~90-100GB peak. Node has ~162Gi alloc ephemeral, so 1 pod/node with 150Gi
+          # request (=> 1 pod/node) and a 145Gi scratch cap gives ample headroom.
+          # (66Gi previously evicted mid-extract.)
+          requests: {nvidia.com/gpu: "1", cpu: "24", memory: "48Gi", ephemeral-storage: "150Gi"}
+          limits:   {nvidia.com/gpu: "1", cpu: "80", memory: "120Gi", ephemeral-storage: "150Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 145Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 16Gi}

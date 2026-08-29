@@ -1,0 +1,57 @@
+# Egocentric-100K Stage-1-over-all filtering — K8s Indexed Job (rendered by python .replace).
+# One pod per stride-slice of the global part.tar index: stream part.tars -> decode + fisheye-undistort
+# -> Stage-1 gates -> upload per-shard survivor manifest. No recon, no persistent frames.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ego-stage1-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 400   # many shards; tolerate transient failures without nuking the job
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node_pool: l4
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: ["us-central1-b", "us-central1-c"]
+      tolerations:
+      - {key: "l4-pool", operator: "Equal", value: "true", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Equal", value: "present", effect: "NoSchedule"}
+      containers:
+      - name: ego-stage1
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_egocentric_stage1.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        workingDir: /repo
+        env:
+        - {name: NSHARDS,     value: "${NSHARDS}"}
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: BALANCE,     value: "${BALANCE}"}
+        - {name: SMOKE_LIMIT, value: "${SMOKE_LIMIT}"}
+        - {name: LOCAL_ROOT,  value: "/scratch/ego_s1"}
+        resources:
+          # Stage-1 streams + decodes; no big disk (only a temp mp4 + sampled frames in RAM at a time).
+          # 1 GPU/pod for YOLO; pack up to ~8 pods/node (GPU-bound) — modest cpu/mem/ephemeral.
+          requests: {nvidia.com/gpu: "1", cpu: "10", memory: "24Gi", ephemeral-storage: "16Gi"}
+          limits:   {nvidia.com/gpu: "1", cpu: "12", memory: "48Gi", ephemeral-storage: "24Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 24Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 8Gi}

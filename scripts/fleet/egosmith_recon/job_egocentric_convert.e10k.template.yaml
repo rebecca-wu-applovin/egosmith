@@ -1,0 +1,57 @@
+# Egocentric-10K Phase B convert VARIANT of job_egocentric_convert.template.yaml
+# (original untouched — the 100K run may still reference it).
+# Changes vs original: pod entry -> pod_entry_egocentric_convert_v2.sh (OUT_WIDTH-capable,
+# standalone converter overlay), adds KEPT_GCS + OUT_WIDTH env, drops the b/c zone pin
+# (queue onto any zone the recon fleet frees). One pod per Stage-1 shard (1:1, 2000).
+# 10K source is 1920x1080 30fps fisheye; OUT_WIDTH=456 lands in the validated 456x256
+# recon regime. ~2.1 kept-h/shard (4,256 kept h / 2000 shards) — lighter than 100K's 12.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ego-convert-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 1000
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node_pool: l4
+      tolerations:
+      - {key: "l4-pool", operator: "Equal", value: "true", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Equal", value: "present", effect: "NoSchedule"}
+      containers:
+      - name: ego-convert
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_egocentric_convert_v2.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        workingDir: /repo
+        env:
+        - {name: NSHARDS,     value: "${COMPLETIONS}"}
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: NPROC,       value: "${NPROC}"}
+        - {name: MAX_CLIPS,   value: "${MAX_CLIPS}"}
+        - {name: TARGET_FPS,  value: "15"}
+        - {name: OUT_WIDTH,   value: "${OUT_WIDTH}"}
+        - {name: LOCAL_ROOT,  value: "/scratch/ego_convert"}
+        - {name: KEPT_GCS,      value: "${KEPT_GCS}"}
+        - {name: FRAMES_GCS,    value: "${FRAMES_GCS}"}
+        - {name: MANIFESTS_GCS, value: "${MANIFESTS_GCS}"}
+        resources:
+          # decode+remap+jpeg is CPU work; 1 GPU requested only for l4-pool packing (8 pods/node).
+          requests: {nvidia.com/gpu: "1", cpu: "10", memory: "20Gi", ephemeral-storage: "30Gi"}
+          limits:   {nvidia.com/gpu: "1", cpu: "12", memory: "40Gi", ephemeral-storage: "45Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 40Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 8Gi}

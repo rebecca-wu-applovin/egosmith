@@ -1,0 +1,54 @@
+# Dexora robot spec -- AIRBOT Play bimanual platform ("robot_type: airbot_play").
+# DoF VERIFICATION (keep-list said "12-DoF hands, verify model"): observation.state is 39-d =
+#   6 left_arm + 6 right_arm + 12 left_hand + 12 right_hand + 2 head + 1 spine.
+#   Hands are 12-DoF CONFIRMED (left/right_hand_joint_1..12) on BOTH layouts
+#   (dexora/<task> per-task repos and airbot_* aggregate repos; identical schema, v2.1).
+# fps: 20 (meta/info.json; timestamp column steps at exactly 0.05 s).
+# Limit derivation method (no manufacturer spec sheet available for this exact stack):
+#   - pos_min/pos_max = [p0.1 - 0.15 rad, p99.9 + 0.15 rad] of the sampled measured-joint
+#     distribution (sample sizes listed below). Positions outside this envelope indicate
+#     encoder glitches / retarget blowups rather than legitimate motion.
+#   - max_vel = per-joint p99.9(|dq/dt|) x 1.5, dt taken from the DATA (per-frame timestamps
+#     when present, else metadata fps). NEVER an assumed frame rate -- limits are
+#     velocity x frame-interval and a wrong fps silently rescales every limit.
+#   - max_acc = per-joint p99.9(|d2q/dt2|) x 1.5, same dt sourcing.
+#   - caps: where the p99.9x1.5 suggestion itself is polluted by glitches (>0.1% of frames
+#     jumping), a physical cap is applied instead and noted inline.
+# Calibration sample: FULL dataset (23,715 episode parquets, both layouts; 450
+#  zero-byte upstream files excluded).
+# NOTE (velocity-drop audit, 2026-08): limits are the CLEAN-TAIL p99.9 x 1.5 --
+# per-joint velocities computed over a 3,030-episode stratified sample (15 eps/task,
+# canonical task-level view), frames with v > 10 x p99 excluded as corrupt before taking
+# p99.9. Key finding: left/right_hand_joint_3 legitimately reaches ~29 rad/s at p99
+# (fast gripper-like DoF; zero frames above 10 x p99 -> genuinely fast, not glitchy).
+# An earlier 25 rad/s cap on that joint velocity-dropped ~4.6K episodes whose motion was
+# smooth and only 1.1-1.6x over the capped limit (audited on 20 episodes across tasks:
+# uniform dt=0.05, no boundary clustering, no teleport signatures). Floors: vel >= 1
+# rad/s, acc >= 50 rad/s^2 (static head/spine joints degenerate to ~0 suggestions).
+# Teleports/corrupt rows are still caught by hard_peak_ratio=3.
+# ACCEL (second audit pass): accel limits anchor at max(clean p99.9 x 1.5,
+# clean p99.99 x 1.15) over the full 3,030-episode stratified sample -- the hand_joint_3
+# channels chatter with a heavy stationary accel tail (p99.99/p99.9 up to 1.8), so the
+# thin x1.5 margin on p99.9 alone dropped ~3.1K episodes whose exceedances were 1.1-1.5x
+# scattered chatter, not corruption (12-episode audit: no teleports, no dt anomalies).
+streams:
+  state:
+    kind: measured
+    dof: 39
+    names: ["left_arm_joint_1", "left_arm_joint_2", "left_arm_joint_3", "left_arm_joint_4", "left_arm_joint_5", "left_arm_joint_6", "right_arm_joint_1", "right_arm_joint_2", "right_arm_joint_3", "right_arm_joint_4", "right_arm_joint_5", "right_arm_joint_6", "left_hand_joint_1", "left_hand_joint_2", "left_hand_joint_3", "left_hand_joint_4", "left_hand_joint_5", "left_hand_joint_6", "left_hand_joint_7", "left_hand_joint_8", "left_hand_joint_9", "left_hand_joint_10", "left_hand_joint_11", "left_hand_joint_12", "right_hand_joint_1", "right_hand_joint_2", "right_hand_joint_3", "right_hand_joint_4", "right_hand_joint_5", "right_hand_joint_6", "right_hand_joint_7", "right_hand_joint_8", "right_hand_joint_9", "right_hand_joint_10", "right_hand_joint_11", "right_hand_joint_12", "head_joint_1", "head_joint_2", "spine_joint"]
+    pos_min: [-0.819, -1.82, -0.013, -2.62, -1.86, -3.06, -1.82, -2.17, 0.026, -3.13, -1.68, -3.16, -0.16, 0.144, -0.198, -0.196, -0.163, -0.21, -0.164, -0.188, -0.173, -0.223, -0.141, -0.197, -0.15, 0.155, -0.173, -0.238, -0.18, -0.197, -0.175, -0.224, -0.169, -0.179, -0.162, -0.217, -0.151, -1.15, 0]
+    pos_max: [1.76, 0.004, 2.86, 3.15, 1.72, 3.15, 0.571, -0.079, 2.33, 3.14, 1.81, 2.97, 1.84, 1.67, 2.04, 0.327, 1.64, 2.09, 1.77, 2.12, 1.86, 2.12, 1.95, 2.1, 1.88, 1.65, 1.23, 0.328, 1.64, 2.11, 1.81, 2.1, 1.96, 2.12, 2.05, 2.13, 0.151, -0.85, 0.3]
+    max_vel: [2.11, 1.59, 1.81, 3.18, 2.46, 3.65, 2.37, 1.73, 1.71, 3.85, 2.76, 3.94, 7.02, 4.18, 56.6, 2.81, 8.11, 17.9, 9.16, 18.9, 9.68, 19, 10.3, 18.4, 7.46, 4.32, 5.06, 2.78, 8.9, 19.1, 9.77, 19, 10.4, 20.2, 11.7, 20.3, 1, 1, 1]
+    max_acc: [50, 50, 50, 55, 50, 64.5, 50, 50, 50, 73.7, 50, 76.3, 178.7, 121.8, 2122, 74.3, 202.8, 467, 228.1, 468.1, 240.3, 461.5, 250.1, 459.7, 180, 123.8, 148.5, 71.2, 208.1, 488.1, 229.5, 486.5, 260.2, 489.2, 284.9, 494.7, 50, 50, 50]
+  action:
+    kind: commanded
+    dof: 39
+gates:
+  pos_limit: {max_violation_frac: 0.002}
+  velocity: {max_violation_frac: 0.02, hard_peak_ratio: 3.0}
+  accel: {max_violation_frac: 0.02, hard_peak_ratio: 4.0}
+  tracking: {pairs: [[action, state]], max_rmse: 0.30, max_p95: 0.60, allow_lag_frames: 3}
+  timestamps: {max_nonmonotonic: 0, dropped_dt_factor: 1.8, max_dropped_frame_ratio: 0.02}
+  video_sync: {max_rel_mismatch: 0.03, max_abs_mismatch: 5}
+  health: {min_len_s: 2.0, max_stall_s: 10.0, stall_eps_rad_s: 0.005, max_nan_frac: 0.0, max_const_channel_frac: 0.6}
+  dedup: {downsample_hz: 5, quant: 0.01}

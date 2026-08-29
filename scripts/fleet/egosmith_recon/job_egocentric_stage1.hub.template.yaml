@@ -1,0 +1,69 @@
+# HUB (Kueue/MultiKueue) VARIANT of job_egocentric_stage1.g2s8.template.yaml for the
+# x-deployment dispatch hub (ns robot, LocalQueue robot). Differences vs .g2s8:
+#   - metadata.labels kueue.x-k8s.io/queue-name + spec.suspend: true (Kueue admits/unsuspends)
+#   - NO ephemeral-storage in requests/limits: ClusterQueues cover only cpu/memory/gpu;
+#     an uncovered requested resource makes the Workload permanently inadmissible
+#     (diagnosed 2026-08-21 on the first hub smoke). emptyDir sizeLimits stay (no quota).
+#   - required region affinity: only mks-l4 (us-east1) carries cohort quota today;
+#     keep us-central1 listed so cbf-l4 becomes usable the moment ops funds it.
+#     Bucket is US-CENTRAL1 — never widen this list to tpe/ehd (cross-continent egress).
+# Render vars: JOB_SUFFIX NAMESPACE K8S_SA QUEUE IMAGE COMPLETIONS PARALLELISM NSHARDS
+#              BALANCE SMOKE_LIMIT PARTS_INDEX_GCS OUTGCS
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ego-stage1-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+  labels:
+    kueue.x-k8s.io/queue-name: ${QUEUE}
+spec:
+  suspend: true
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 400
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node.kubernetes.io/instance-type: g2-standard-8
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/region
+                operator: In
+                values: ["us-central1", "us-east1"]
+      tolerations:
+      - {key: "applvn.dev/workload", operator: "Equal", value: "model-serve", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule"}
+      containers:
+      - name: ego-stage1
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_egocentric_stage1.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        workingDir: /repo
+        env:
+        - {name: NSHARDS,     value: "${NSHARDS}"}
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: BALANCE,     value: "${BALANCE}"}
+        - {name: SMOKE_LIMIT, value: "${SMOKE_LIMIT}"}
+        - {name: PARTS_INDEX_GCS, value: "${PARTS_INDEX_GCS}"}
+        - {name: OUTGCS,      value: "${OUTGCS}"}
+        - {name: LOCAL_ROOT,  value: "/scratch/ego_s1"}
+        resources:
+          # cpu/memory/gpu ONLY — see header. Scratch bounded by the emptyDir sizeLimit.
+          requests: {nvidia.com/gpu: "1", cpu: "6", memory: "20Gi"}
+          limits:   {nvidia.com/gpu: "1", cpu: "7", memory: "28Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 24Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 6Gi}

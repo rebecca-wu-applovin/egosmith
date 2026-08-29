@@ -1,0 +1,56 @@
+# Cat-1 Phase B convert (VIDEO sources: assembly101 / hd_epic / epic_kitchens_100 /
+# ego4d / holoassist). Variant of job_egocentric_convert.e10k.template.yaml driven by
+# pod_entry_cat1_convert.sh (video decode + time-sampled 15fps + optional cv2.fisheye
+# undistort from CAT1 intrinsics). One pod per phaseB_input shard
+# (reshard_stage1_survivors.py output, ~0.5-0.75 kept-h / <=25 source-GB each).
+# CPU work; 1 GPU requested only for l4-pool packing (8 pods/node).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cat1-convert-${JOB_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  completionMode: Indexed
+  completions: ${COMPLETIONS}
+  parallelism: ${PARALLELISM}
+  backoffLimit: 1000
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ${K8S_SA}
+      nodeSelector:
+        node_pool: l4
+      tolerations:
+      - {key: "l4-pool", operator: "Equal", value: "true", effect: "NoSchedule"}
+      - {key: "nvidia.com/gpu", operator: "Equal", value: "present", effect: "NoSchedule"}
+      containers:
+      - name: cat1-convert
+        image: ${IMAGE}
+        command: ["bash","-lc","gcloud storage cp gs://foundational-research/hoi-dataset/egosmith_recon/fleet/pod_entry_cat1_convert.sh /tmp/pe.sh && exec bash /tmp/pe.sh"]
+        workingDir: /repo
+        env:
+        - {name: DS,          value: "${DS}"}
+        - {name: NSHARDS,     value: "${COMPLETIONS}"}
+        - name: SHARD
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - {name: NPROC,       value: "${NPROC}"}
+        - {name: MAX_CLIPS,   value: "${MAX_CLIPS}"}
+        - {name: TARGET_FPS,  value: "15"}
+        - {name: OUT_WIDTH,   value: "456"}
+        - {name: ID_MODE,     value: "${ID_MODE}"}
+        - {name: LOCAL_ROOT,  value: "/scratch/cat1_convert"}
+        resources:
+          # decode+resize/remap+jpeg is CPU work; ephemeral must hold NPROC source
+          # videos at once (shards are bytes-capped at 25GB by the resharder).
+          requests: {nvidia.com/gpu: "1", cpu: "10", memory: "20Gi", ephemeral-storage: "40Gi"}
+          limits:   {nvidia.com/gpu: "1", cpu: "12", memory: "40Gi", ephemeral-storage: "60Gi"}
+        volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: scratch
+        emptyDir: {sizeLimit: 60Gi}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 8Gi}
